@@ -1,0 +1,980 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Session Debug Viewer</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    font-family: -apple-system, Segoe UI, sans-serif;
+    background: #0f1115;
+    color: #e6e6e6;
+    display: flex;
+    flex-direction: column;
+  }
+  .topbar {
+    flex: 0 0 auto;
+    padding: 12px 16px 0;
+  }
+  .session-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  input {
+    flex: 1;
+    min-width: 220px;
+    padding: 8px 10px;
+    background: #1a1d24;
+    border: 1px solid #333;
+    color: #e6e6e6;
+    border-radius: 6px;
+  }
+  button {
+    padding: 8px 14px;
+    background: #2b6cb0;
+    border: none;
+    color: white;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  button.secondary { background: #333; }
+  label { font-size: 13px; display: flex; align-items: center; gap: 4px; }
+  .status { font-size: 13px; color: #999; margin-left: auto; }
+  .tabs {
+    display: flex;
+    gap: 4px;
+  }
+  .tab-link {
+    padding: 8px 16px;
+    border-radius: 6px 6px 0 0;
+    color: #999;
+    text-decoration: none;
+    font-size: 13px;
+    cursor: pointer;
+    background: #1a1d24;
+    border: 1px solid #262a33;
+    border-bottom: none;
+  }
+  .tab-link.active {
+    color: #e6e6e6;
+    background: #171a21;
+  }
+  .composer {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 8px;
+    padding: 10px 16px;
+    background: #12141a;
+    border-top: 1px solid #262a33;
+    border-bottom: 1px solid #262a33;
+  }
+  .composer input { flex: 1; }
+  .content {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 0 16px 16px;
+  }
+  .view {
+    display: none;
+    height: 100%;
+    padding-top: 12px;
+  }
+  .view.active { display: flex; flex-direction: column; }
+  .panel {
+    background: #171a21;
+    border: 1px solid #262a33;
+    border-radius: 8px;
+    padding: 12px;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .panel h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #8ab4f8;
+    margin: 0 0 10px;
+  }
+  .field-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid #21242c;
+    font-size: 13px;
+  }
+  .field-row.missing { color: #555; font-style: italic; }
+  .field-row .val { color: #d7d7d7; max-width: 60%; text-align: right; word-break: break-word; }
+
+  .trace-card {
+    border: 1px solid #262a33;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: #12141a;
+  }
+  .trace-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 12.5px;
+  }
+  .trace-card-header .node-name { font-weight: 600; color: #e6e6e6; }
+  .trace-card-header .action { color: #999; flex: 1; min-width: 120px; }
+  .trace-card-header .duration { color: #777; font-size: 11px; }
+  .badge {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+  .badge.model { background: rgba(138, 180, 248, 0.15); color: #8ab4f8; }
+  .badge.rule { background: rgba(255, 255, 255, 0.06); color: #888; }
+  .trace-section { margin-top: 6px; font-size: 12px; }
+  .trace-section summary {
+    cursor: pointer;
+    color: #8ab4f8;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 4px 0;
+  }
+  .trace-section-body { padding-top: 4px; }
+  .prompt-block {
+    margin: 4px 0;
+    padding: 6px 8px;
+    background: #0d0f13;
+    border-radius: 6px;
+    border: 1px solid #20232b;
+  }
+  .prompt-role { font-size: 10px; color: #7ee0a8; margin-bottom: 4px; letter-spacing: 0.05em; }
+  .trace-section pre, .rule-io pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+    font-family: inherit;
+    font-size: 11.5px;
+    color: #ccc;
+  }
+  .rule-io { padding-top: 4px; }
+  .rule-io .io { color: #999; font-size: 12px; margin-top: 2px; }
+
+  .msg { margin-bottom: 10px; padding: 8px 10px; border-radius: 8px; font-size: 13px; line-height: 1.4; }
+  .msg.user { background: #1e2530; margin-left: 20px; }
+  .msg.assistant { background: #202417; margin-right: 20px; }
+  .msg .role { font-size: 10px; text-transform: uppercase; color: #888; margin-bottom: 3px; }
+  .empty { color: #555; font-size: 13px; font-style: italic; }
+  .msg.pending { opacity: 0.7; }
+  .graph-panel {
+    display: flex;
+    flex-direction: column;
+    background: #171a21;
+    border: 1px solid #262a33;
+    border-radius: 8px;
+    padding: 12px;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  .graph-panel .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  .graph-panel h2 { margin: 0; }
+  .legend { display: flex; gap: 12px; font-size: 11px; color: #999; flex-wrap: wrap; }
+  .legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  #graphCanvas {
+    width: 100%;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: block;
+    background: #0d0f13;
+    border-radius: 6px;
+    cursor: grab;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="session-row">
+    <input id="sessionId" placeholder="Paste session_id, or leave blank to start a new one..." />
+    <button id="loadBtn">Load</button>
+    <button id="refreshBtn" class="secondary">Refresh</button>
+    <button id="newSessionBtn" class="secondary">New Session</button>
+    <label><input type="checkbox" id="autoRefresh" /> Auto (3s)</label>
+    <span class="status" id="status"></span>
+  </div>
+  <nav class="tabs">
+    <a href="#/context" class="tab-link" data-route="context">Context</a>
+    <a href="#/trace" class="tab-link" data-route="trace">Process Trace</a>
+    <a href="#/conversation" class="tab-link" data-route="conversation">Conversation</a>
+    <a href="#/graph" class="tab-link" data-route="graph">Knowledge Graph</a>
+  </nav>
+</div>
+
+<div class="composer">
+  <input id="chatInput" placeholder="Type a message and press Enter..." />
+  <button id="sendBtn">Send</button>
+</div>
+
+<main class="content">
+  <section id="section-context" class="view">
+    <div class="panel">
+      <h2>Context</h2>
+      <div id="contextPanel"><div class="empty">No session loaded</div></div>
+    </div>
+  </section>
+
+  <section id="section-trace" class="view">
+    <div class="panel">
+      <h2>Process Trace</h2>
+      <div id="tracePanel"><div class="empty">No session loaded</div></div>
+    </div>
+  </section>
+
+  <section id="section-conversation" class="view">
+    <div class="panel">
+      <h2>Conversation</h2>
+      <div id="conversationPanel"><div class="empty">No session loaded</div></div>
+    </div>
+  </section>
+
+  <section id="section-graph" class="view">
+    <div class="graph-panel">
+      <div class="panel-header">
+        <h2>Knowledge Graph</h2>
+        <div style="display:flex; gap:12px; align-items:center;">
+          <div class="legend" id="graphLegend"></div>
+          <button id="resetLayoutBtn" class="secondary">Reset Layout</button>
+        </div>
+      </div>
+      <canvas id="graphCanvas"></canvas>
+    </div>
+  </section>
+</main>
+
+<script>
+let pollTimer = null;
+
+function qs(name) {
+  return new URLSearchParams(window.location.search).get(name);
+}
+
+function setStatus(text) {
+  document.getElementById('status').textContent = text;
+}
+
+const ROUTES = ['context', 'trace', 'conversation', 'graph'];
+
+function currentRoute() {
+  const hash = window.location.hash.replace(/^#\/?/, '');
+  return ROUTES.includes(hash) ? hash : 'conversation';
+}
+
+function renderRoute() {
+  const route = currentRoute();
+  ROUTES.forEach((r) => {
+    document.getElementById('section-' + r).classList.toggle('active', r === route);
+    document.querySelector(`.tab-link[data-route="${r}"]`).classList.toggle('active', r === route);
+  });
+  if (route === 'graph' && resizeGraphCanvasFn) {
+    resizeGraphCanvasFn();
+  }
+}
+
+function renderField(el, key, val) {
+  const row = document.createElement('div');
+  row.className = 'field-row' + (val === null || val === undefined ? ' missing' : '');
+  const display = val === null || val === undefined ? 'missing' : escapeHtml(String(val));
+  row.innerHTML = `<span>${escapeHtml(key)}</span><span class="val">${display}</span>`;
+  el.appendChild(row);
+}
+
+function renderSectionHeading(el, text) {
+  const h = document.createElement('div');
+  h.style.cssText = 'font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7280; margin: 12px 0 4px;';
+  h.textContent = text;
+  el.appendChild(h);
+}
+
+// nodes: the flat KnowledgeNode list from GET /sessions/{id}/state
+// ("knowledge_nodes") — see app/routes.py. session: the same response, for
+// its active_room_id/pending_gap/pending_confirmation fields.
+function renderContext(nodes, session) {
+  const el = document.getElementById('contextPanel');
+  el.innerHTML = '';
+
+  if (!nodes || !nodes.length) {
+    el.innerHTML = '<div class="empty">No context yet</div>';
+    return;
+  }
+
+  const byPath = {};
+  nodes.forEach((n) => { byPath[n.canonical_path] = n; });
+  const valueAt = (path) => (byPath[path] ? byPath[path].value : null);
+
+  renderSectionHeading(el, 'Project');
+  renderField(el, 'project type', valueAt('Project.BasicInformation.ProjectType'));
+  renderField(el, 'overall budget', valueAt('Project.Budget.Total'));
+  renderField(el, 'timeline', valueAt('Project.Timeline.Value'));
+
+  renderSectionHeading(el, 'Rooms');
+  const rooms = nodes.filter((n) => n.node_type === 'Rooms' && n.canonical_path !== 'Project.Rooms');
+  if (!rooms.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No rooms yet';
+    el.appendChild(empty);
+  } else {
+    rooms.forEach((room, i) => {
+      const roomId = room.canonical_path.split('.').pop();
+      const prefix = room.canonical_path;
+      const isActive = roomId === session.active_room_id;
+      const roomType = valueAt(`${prefix}.RoomType`);
+      const roomHeading = document.createElement('div');
+      roomHeading.style.cssText = 'font-weight: 600; color: #d7d7d7; margin: 10px 0 2px; font-size: 13px;';
+      roomHeading.textContent = (roomType || `Room ${i + 1}`) + (isActive ? ' (active)' : '');
+      el.appendChild(roomHeading);
+
+      renderField(el, 'room type', roomType);
+      renderField(el, 'budget', valueAt(`${prefix}.Budget`));
+      renderField(el, 'style', valueAt(`${prefix}.Style`));
+      renderField(el, 'square footage', valueAt(`${prefix}.SquareFootage`));
+      renderField(el, 'existing furniture', valueAt(`${prefix}.ExistingFurniture`));
+      renderMaterialsForRoom(el, byPath, nodes, prefix);
+      renderFreeformBucket(el, byPath, nodes, `${prefix}.Furniture`, 'furniture');
+      renderFreeformBucket(el, byPath, nodes, `${prefix}.Attributes`, 'other details');
+    });
+  }
+
+  renderSectionHeading(el, 'Requirements');
+  renderFreeformBucket(el, byPath, nodes, 'Project.Requirements.ClientPreferences', 'preferences');
+  renderFreeformBucket(el, byPath, nodes, 'Project.Requirements.Constraints', 'constraints');
+
+  // Provenance replaces the old confirmed/assumed/skipped field_status
+  // breakdown — see app/models.py::ChangedBy (Phase 8/12): which values
+  // came directly from the client vs. were inferred vs. calculated.
+  renderSectionHeading(el, 'Provenance');
+  const counts = { user_message: 0, inferred: 0, system_default: 0 };
+  nodes.forEach((n) => {
+    if (n.value !== null && n.value !== undefined && Object.prototype.hasOwnProperty.call(counts, n.changed_by)) {
+      counts[n.changed_by]++;
+    }
+  });
+  renderField(el, 'stated by client', counts.user_message);
+  renderField(el, 'inferred', counts.inferred);
+  renderField(el, 'calculated', counts.system_default);
+}
+
+function renderMaterialsForRoom(el, byPath, nodes, roomPrefix) {
+  const materialsPrefix = `${roomPrefix}.Materials.`;
+  const itemSlugs = [...new Set(
+    nodes
+      .filter((n) => n.canonical_path.startsWith(materialsPrefix))
+      .map((n) => n.canonical_path.slice(materialsPrefix.length).split('.')[0])
+  )];
+
+  const header = document.createElement('div');
+  const isEmpty = itemSlugs.length === 0;
+  header.className = 'field-row' + (isEmpty ? ' missing' : '');
+  header.innerHTML = `<span>materials</span><span class="val">${isEmpty ? 'missing' : `${itemSlugs.length} item${itemSlugs.length === 1 ? '' : 's'}`}</span>`;
+  el.appendChild(header);
+  if (isEmpty) return;
+
+  const list = document.createElement('div');
+  list.style.cssText = 'padding: 2px 0 10px 12px; font-size: 12px; color: #aaa;';
+  list.innerHTML = itemSlugs
+    .map((slug) => {
+      const item = byPath[`${materialsPrefix}${slug}.Label`];
+      const material = byPath[`${materialsPrefix}${slug}.Material`];
+      const spec = byPath[`${materialsPrefix}${slug}.Specification`];
+      const itemLabel = item ? String(item.value) : slug;
+      const materialLabel = material ? String(material.value) : '?';
+      const specText = spec && spec.value ? ` <span style="color:#777">(${escapeHtml(String(spec.value))})</span>` : '';
+      return `<div style="padding:3px 0;">${escapeHtml(itemLabel)}: ${escapeHtml(materialLabel)}${specText}</div>`;
+    })
+    .join('');
+  el.appendChild(list);
+}
+
+// Renders a freeform "fact bucket" (Furniture/Attributes/ClientPreferences/
+// Constraints — see ontology/v1.yaml) as a list of its instances' Label
+// values, same shape as renderMaterialsForRoom above.
+function renderFreeformBucket(el, byPath, nodes, containerPath, label) {
+  const prefix = containerPath + '.';
+  const instanceSlugs = [...new Set(
+    nodes
+      .filter((n) => n.canonical_path.startsWith(prefix))
+      .map((n) => n.canonical_path.slice(prefix.length).split('.')[0])
+  )];
+
+  const header = document.createElement('div');
+  const isEmpty = instanceSlugs.length === 0;
+  header.className = 'field-row' + (isEmpty ? ' missing' : '');
+  header.innerHTML = `<span>${escapeHtml(label)}</span><span class="val">${isEmpty ? 'none noted' : `${instanceSlugs.length} noted`}</span>`;
+  el.appendChild(header);
+  if (isEmpty) return;
+
+  const list = document.createElement('div');
+  list.style.cssText = 'padding: 2px 0 10px 12px; font-size: 12px; color: #aaa;';
+  list.innerHTML = instanceSlugs
+    .map((slug) => {
+      const labelNode = byPath[`${prefix}${slug}.Label`];
+      return `<div style="padding:3px 0;">${escapeHtml(labelNode ? String(labelNode.value) : slug)}</div>`;
+    })
+    .join('');
+  el.appendChild(list);
+}
+
+function renderTraceEntry(t) {
+  const card = document.createElement('div');
+  card.className = 'trace-card';
+
+  const header = document.createElement('div');
+  header.className = 'trace-card-header';
+  const isLlm = !!(t.llm_input || t.llm_output);
+  const badgeClass = t.model_used ? 'badge model' : 'badge rule';
+  const badgeText = t.model_used || 'rule-based';
+  header.innerHTML = `
+    <span class="node-name">${escapeHtml(t.node_name)}</span>
+    <span class="action">${escapeHtml(t.output_summary)}</span>
+    <span class="duration">${t.duration_ms}ms</span>
+    <span class="${badgeClass}">${escapeHtml(badgeText)}</span>
+  `;
+  card.appendChild(header);
+
+  if (isLlm) {
+    if (t.llm_input) {
+      const details = document.createElement('details');
+      details.className = 'trace-section';
+      details.open = true;
+      const summary = document.createElement('summary');
+      summary.textContent = 'LLM Input';
+      details.appendChild(summary);
+      const body = document.createElement('div');
+      body.className = 'trace-section-body';
+      t.llm_input.forEach((m) => {
+        const block = document.createElement('div');
+        block.className = 'prompt-block';
+        const roleLabel = document.createElement('div');
+        roleLabel.className = 'prompt-role';
+        roleLabel.textContent = (m.role || '').toUpperCase();
+        const pre = document.createElement('pre');
+        pre.textContent = typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2);
+        block.appendChild(roleLabel);
+        block.appendChild(pre);
+        body.appendChild(block);
+      });
+      details.appendChild(body);
+      card.appendChild(details);
+    }
+    if (t.llm_output) {
+      const details = document.createElement('details');
+      details.className = 'trace-section';
+      details.open = true;
+      const summary = document.createElement('summary');
+      summary.textContent = 'LLM Output';
+      details.appendChild(summary);
+      const body = document.createElement('div');
+      body.className = 'trace-section-body';
+      const pre = document.createElement('pre');
+      pre.textContent = t.llm_output;
+      body.appendChild(pre);
+      details.appendChild(body);
+      card.appendChild(details);
+    }
+  } else {
+    const body = document.createElement('div');
+    body.className = 'rule-io';
+    const inputLine = document.createElement('div');
+    inputLine.className = 'io';
+    inputLine.textContent = 'input: ' + t.input_summary;
+    const outputLine = document.createElement('div');
+    outputLine.className = 'io';
+    outputLine.textContent = 'output: ' + t.output_summary;
+    body.appendChild(inputLine);
+    body.appendChild(outputLine);
+    card.appendChild(body);
+  }
+
+  return card;
+}
+
+function renderTrace(trace) {
+  const el = document.getElementById('tracePanel');
+  if (!trace.length) { el.innerHTML = '<div class="empty">No trace entries yet</div>'; return; }
+  el.innerHTML = '';
+  trace.forEach((t) => el.appendChild(renderTraceEntry(t)));
+}
+
+function renderConversation(messages) {
+  const el = document.getElementById('conversationPanel');
+  if (!messages.length) { el.innerHTML = '<div class="empty">No messages yet</div>'; return; }
+  el.innerHTML = '';
+  messages.forEach(m => {
+    const div = document.createElement('div');
+    div.className = 'msg ' + m.role;
+    div.innerHTML = `<div class="role">${m.role}</div><div>${escapeHtml(m.content)}</div>`;
+    el.appendChild(div);
+  });
+  el.scrollTop = el.scrollHeight;
+}
+
+// Node color now reflects the tree structure + provenance
+// (app.models.ChangedBy) rather than the old ContextGraph GraphNodeType —
+// there's no separate freeform "graph" anymore, this IS the knowledge tree,
+// so "room" (a Rooms instance container), "container" (any other structural
+// node with no value of its own — Project, BasicInformation, Materials,
+// ...), and then the three provenance colors for actual leaf values.
+const NODE_COLORS = {
+  room: '#8ab4f8',
+  container: '#5b6472',
+  stated: '#7ee0a8',
+  inferred: '#c58af9',
+  calculated: '#f7c948',
+};
+
+function graphNodeType(n) {
+  if (n.value === null || n.value === undefined) {
+    return n.node_type === 'Rooms' ? 'room' : 'container';
+  }
+  if (n.changed_by === 'inferred') return 'inferred';
+  if (n.changed_by === 'system_default') return 'calculated';
+  return 'stated';
+}
+
+// Builds the {nodes, edges} shape drawGraph()/updateGraphData() expect from
+// the flat KnowledgeNode list — edges are just parent_id -> node_id (the
+// tree structure itself; there's no separate relation graph until
+// app/dependency_graph.py's KnowledgeEdge gets a live writer).
+function buildGraphFromNodes(nodes) {
+  const list = nodes || [];
+  const gNodes = list.map((n) => ({
+    id: n.node_id,
+    label: n.value !== null && n.value !== undefined
+      ? `${n.canonical_path.split('.').pop()}: ${n.value}`
+      : n.canonical_path.split('.').pop(),
+    type: graphNodeType(n),
+  }));
+  const gEdges = list
+    .filter((n) => n.parent_id)
+    .map((n) => ({ source: n.parent_id, target: n.node_id, relation: 'part_of' }));
+  return { nodes: gNodes, edges: gEdges };
+}
+
+const graphLayout = new Map(); // id -> {x, y, vx, vy, pinned}
+let graphNodes = [];
+let graphEdges = [];
+let draggingNodeId = null;
+let graphCanvas = null;
+let graphCtx = null;
+let resizeGraphCanvasFn = null;
+
+function renderLegend() {
+  const el = document.getElementById('graphLegend');
+  el.innerHTML = Object.entries(NODE_COLORS)
+    .map(([type, color]) => `<span><span class="dot" style="background:${color}"></span>${type}</span>`)
+    .join('');
+}
+
+function canvasPoint(e) {
+  const rect = graphCanvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function findNodeAt(x, y) {
+  for (const n of graphNodes) {
+    const p = graphLayout.get(n.id);
+    if (!p) continue;
+    const dx = p.x - x, dy = p.y - y;
+    if (dx * dx + dy * dy <= 14 * 14) return n;
+  }
+  return null;
+}
+
+function initGraphCanvas() {
+  graphCanvas = document.getElementById('graphCanvas');
+  graphCtx = graphCanvas.getContext('2d');
+
+  const resize = () => {
+    const rect = graphCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    graphCanvas.width = rect.width * dpr;
+    graphCanvas.height = rect.height * dpr;
+    graphCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  };
+  resize();
+  window.addEventListener('resize', resize);
+  resizeGraphCanvasFn = resize;
+
+  graphCanvas.addEventListener('mousedown', (e) => {
+    const { x, y } = canvasPoint(e);
+    const hit = findNodeAt(x, y);
+    if (hit) {
+      draggingNodeId = hit.id;
+      graphCanvas.style.cursor = 'grabbing';
+    }
+  });
+  graphCanvas.addEventListener('mousemove', (e) => {
+    if (!draggingNodeId) return;
+    const { x, y } = canvasPoint(e);
+    const p = graphLayout.get(draggingNodeId);
+    if (p) { p.x = x; p.y = y; p.vx = 0; p.vy = 0; }
+  });
+  window.addEventListener('mouseup', () => {
+    if (draggingNodeId) {
+      const p = graphLayout.get(draggingNodeId);
+      if (p) p.pinned = true;
+    }
+    draggingNodeId = null;
+    graphCanvas.style.cursor = 'grab';
+  });
+}
+
+function updateGraphData(nodes, edges) {
+  graphNodes = nodes || [];
+  graphEdges = edges || [];
+  // loadSession() can resolve before the graph tab's own resize() has taken
+  // effect (e.g. the very first load, where initGraphCanvas() measures the
+  // canvas while its section is still display:none). Re-resize here so new
+  // nodes are never seeded around a stale 0x0 rect.
+  if (resizeGraphCanvasFn) resizeGraphCanvasFn();
+  const rect = graphCanvas.getBoundingClientRect();
+  const cx = rect.width / 2, cy = rect.height / 2;
+  const seen = new Set(graphNodes.map((n) => n.id));
+
+  // Labels are drawn to the right of each node's circle, so two nodes whose
+  // centers clear the circle-only separation can still have their text
+  // collide. Measure each label once here and let tickGraphPhysics widen
+  // the separation it enforces based on the wider of the two labels.
+  graphCtx.font = '11px sans-serif';
+  for (const n of graphNodes) {
+    n.labelWidth = graphCtx.measureText(n.label).width;
+  }
+
+  for (const n of graphNodes) {
+    if (!graphLayout.has(n.id)) {
+      graphLayout.set(n.id, {
+        x: cx + (Math.random() - 0.5) * 120,
+        y: cy + (Math.random() - 0.5) * 120,
+        vx: 0,
+        vy: 0,
+        pinned: false,
+      });
+    }
+  }
+  for (const id of [...graphLayout.keys()]) {
+    if (!seen.has(id)) graphLayout.delete(id);
+  }
+}
+
+function resetGraphLayout() {
+  graphLayout.clear();
+  updateGraphData(graphNodes, graphEdges);
+}
+
+function tickGraphPhysics() {
+  if (!graphCanvas) return;
+  const rect = graphCanvas.getBoundingClientRect();
+  const w = rect.width, h = rect.height;
+  const cx = w / 2, cy = h / 2;
+
+  // Node circle (radius 9) plus label text both need clearance, so a soft
+  // inverse-square repulsion alone isn't enough — at low velocity/high
+  // damping it converges to nodes visibly touching/overlapping once there
+  // are more than a handful. MIN_SEPARATION adds a hard positional nudge on
+  // top of the force so nodes and their labels never actually overlap.
+  // Labels sit to the right of the circle and vary widely in length (a bare
+  // "kitchen" vs. a full freeform sentence), so the separation floor scales
+  // with the wider label of each pair rather than using one fixed radius.
+  const BASE_SEPARATION = 46;
+  for (let i = 0; i < graphNodes.length; i++) {
+    const a = graphLayout.get(graphNodes[i].id);
+    if (!a) continue;
+    for (let j = i + 1; j < graphNodes.length; j++) {
+      const b = graphLayout.get(graphNodes[j].id);
+      if (!b) continue;
+      const minSeparation = BASE_SEPARATION + Math.max(graphNodes[i].labelWidth || 0, graphNodes[j].labelWidth || 0);
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const distSq = dx * dx + dy * dy || 0.01;
+      const dist = Math.sqrt(distSq);
+      const force = 1800 / distSq;
+      const fx = (dx / dist) * force, fy = (dy / dist) * force;
+      if (!a.pinned) { a.vx += fx; a.vy += fy; }
+      if (!b.pinned) { b.vx -= fx; b.vy -= fy; }
+
+      if (dist < minSeparation) {
+        const overlap = (minSeparation - dist) / 2;
+        const nx = dx / dist, ny = dy / dist;
+        if (!a.pinned) { a.x += nx * overlap; a.y += ny * overlap; }
+        if (!b.pinned) { b.x -= nx * overlap; b.y -= ny * overlap; }
+      }
+    }
+  }
+
+  for (const e of graphEdges) {
+    const a = graphLayout.get(e.source), b = graphLayout.get(e.target);
+    if (!a || !b) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+    const rest = 110;
+    const force = (dist - rest) * 0.02;
+    const fx = (dx / dist) * force, fy = (dy / dist) * force;
+    if (!a.pinned) { a.vx += fx; a.vy += fy; }
+    if (!b.pinned) { b.vx -= fx; b.vy -= fy; }
+  }
+
+  for (const n of graphNodes) {
+    const p = graphLayout.get(n.id);
+    if (!p || p.pinned) continue;
+    p.vx += (cx - p.x) * 0.002;
+    p.vy += (cy - p.y) * 0.002;
+    p.vx *= 0.85;
+    p.vy *= 0.85;
+    p.x += p.vx;
+    p.y += p.vy;
+    p.x = Math.max(16, Math.min(w - 16, p.x));
+    p.y = Math.max(16, Math.min(h - 16, p.y));
+  }
+}
+
+function drawGraph() {
+  if (!graphCtx) return;
+  const rect = graphCanvas.getBoundingClientRect();
+  graphCtx.clearRect(0, 0, rect.width, rect.height);
+
+  if (!graphNodes.length) {
+    graphCtx.fillStyle = '#555';
+    graphCtx.font = '13px sans-serif';
+    graphCtx.fillText('No graph nodes yet', 16, 24);
+    return;
+  }
+
+  graphCtx.strokeStyle = '#3a3f4b';
+  graphCtx.fillStyle = '#8a8f99';
+  graphCtx.font = '10px sans-serif';
+  for (const e of graphEdges) {
+    const a = graphLayout.get(e.source), b = graphLayout.get(e.target);
+    if (!a || !b) continue;
+    graphCtx.beginPath();
+    graphCtx.moveTo(a.x, a.y);
+    graphCtx.lineTo(b.x, b.y);
+    graphCtx.stroke();
+    graphCtx.fillText(e.relation, (a.x + b.x) / 2, (a.y + b.y) / 2);
+  }
+
+  for (const n of graphNodes) {
+    const p = graphLayout.get(n.id);
+    if (!p) continue;
+    graphCtx.beginPath();
+    graphCtx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+    graphCtx.fillStyle = NODE_COLORS[n.type] || NODE_COLORS.container;
+    graphCtx.fill();
+    graphCtx.strokeStyle = p.pinned ? '#fff' : '#111';
+    graphCtx.lineWidth = p.pinned ? 2 : 1;
+    graphCtx.stroke();
+
+    graphCtx.fillStyle = '#e6e6e6';
+    graphCtx.font = '11px sans-serif';
+    // Labels normally sit to the right of the node, but that runs off-canvas
+    // for nodes pushed toward the right wall — flip to the left there so the
+    // text stays fully visible instead of getting clipped at the edge.
+    const labelWidth = n.labelWidth || 0;
+    const labelX = p.x + 12 + labelWidth > rect.width ? p.x - 12 - labelWidth : p.x + 12;
+    graphCtx.fillText(n.label, labelX, p.y + 4);
+  }
+}
+
+function graphLoop() {
+  tickGraphPhysics();
+  drawGraph();
+  requestAnimationFrame(graphLoop);
+}
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str ?? '';
+  return d.innerHTML;
+}
+
+async function loadSession() {
+  const id = document.getElementById('sessionId').value.trim();
+  if (!id) return;
+  setStatus('loading...');
+  try {
+    const res = await fetch(`/sessions/${encodeURIComponent(id)}/state`);
+    if (!res.ok) {
+      setStatus(`error: ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    renderContext(data.knowledge_nodes, data);
+    liveTrace = data.trace;
+    renderTrace(liveTrace);
+    renderConversation(data.messages);
+    const graph = buildGraphFromNodes(data.knowledge_nodes);
+    updateGraphData(graph.nodes, graph.edges);
+    setStatus(`status: ${data.status} · last loaded ${new Date().toLocaleTimeString()}`);
+  } catch (e) {
+    setStatus('error: ' + e.message);
+  }
+}
+
+function appendLiveMessage(role, content) {
+  const el = document.getElementById('conversationPanel');
+  if (el.querySelector('.empty')) el.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'msg ' + role + ' pending';
+  div.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
+  div.querySelector('.content').textContent = content;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  return div;
+}
+
+// Holds this session's trace entries between full /state refetches — appended
+// to live as 'trace' SSE events arrive during a send, then wholly replaced by
+// the authoritative list once loadSession() runs at the end of the turn.
+let liveTrace = [];
+
+async function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = '';
+  document.getElementById('sendBtn').disabled = true;
+  setStatus('sending...');
+
+  const sid = document.getElementById('sessionId').value.trim() || null;
+  const body = sid ? { session_id: sid, message } : { message };
+
+  appendLiveMessage('user', message);
+  const liveAssistant = appendLiveMessage('assistant', '');
+  let answerText = '';
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok || !res.body) {
+      setStatus(`error: ${res.status}`);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop();
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        const evt = JSON.parse(line.slice(5).trim());
+        if (evt.type === 'token') {
+          answerText += evt.content;
+          liveAssistant.querySelector('.content').textContent = answerText;
+        } else if (evt.type === 'progress') {
+          setStatus(`running: ${evt.node}...`);
+        } else if (evt.type === 'trace') {
+          liveTrace = liveTrace.concat(evt.entries);
+          renderTrace(liveTrace);
+        } else if (evt.type === 'context_updated') {
+          // update_context turns never stream an "answer" (no generate_answer
+          // call on that branch), so the pending assistant bubble created for
+          // streaming is still empty — drop it in favor of the confirmation.
+          if (!answerText) liveAssistant.remove();
+          appendLiveMessage('assistant', evt.message);
+        } else if (evt.type === 'ask_question') {
+          appendLiveMessage('assistant', evt.question);
+        } else if (evt.type === 'confirm_change') {
+          // A critical-tier field changed value — app.graph.build_context_node
+          // held it back pending a yes/no reply instead of silently
+          // overwriting (see app.context_builder.detect_conflicts).
+          appendLiveMessage('assistant', evt.question);
+        } else if (evt.type === 'wrapup') {
+          // Closing statement sent once the intake completes — same
+          // pending-bubble handling as context_updated above, since this
+          // never streams a separate "answer" either.
+          if (!answerText) liveAssistant.remove();
+          appendLiveMessage('assistant', evt.message);
+        } else if (evt.type === 'image_description') {
+          appendLiveMessage('assistant', '[image] ' + evt.content);
+        } else if (evt.type === 'error') {
+          liveAssistant.remove();
+          appendLiveMessage('assistant', `[error] ${evt.message}`);
+          setStatus(`error: ${evt.message}`);
+        } else if (evt.type === 'done') {
+          document.getElementById('sessionId').value = evt.session_id;
+        }
+      }
+    }
+  } catch (e) {
+    setStatus('error: ' + e.message);
+  } finally {
+    document.getElementById('sendBtn').disabled = false;
+    await loadSession();
+  }
+}
+
+document.getElementById('loadBtn').addEventListener('click', loadSession);
+document.getElementById('refreshBtn').addEventListener('click', loadSession);
+document.getElementById('sendBtn').addEventListener('click', sendMessage);
+document.getElementById('chatInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendMessage();
+});
+document.getElementById('resetLayoutBtn').addEventListener('click', resetGraphLayout);
+document.getElementById('newSessionBtn').addEventListener('click', () => {
+  document.getElementById('sessionId').value = '';
+  document.getElementById('contextPanel').innerHTML = '<div class="empty">No session loaded</div>';
+  liveTrace = [];
+  document.getElementById('tracePanel').innerHTML = '<div class="empty">No session loaded</div>';
+  document.getElementById('conversationPanel').innerHTML = '<div class="empty">No session loaded</div>';
+  graphLayout.clear();
+  updateGraphData([], []);
+  setStatus('new session ready — send a message to create it');
+});
+document.getElementById('autoRefresh').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    pollTimer = setInterval(loadSession, 3000);
+  } else if (pollTimer) {
+    clearInterval(pollTimer);
+  }
+});
+window.addEventListener('hashchange', renderRoute);
+
+initGraphCanvas();
+renderLegend();
+requestAnimationFrame(graphLoop);
+renderRoute();
+
+const initial = qs('session_id');
+if (initial) {
+  document.getElementById('sessionId').value = initial;
+  loadSession();
+}
+</script>
+</body>
+</html>

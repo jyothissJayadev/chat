@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # MongoDB is Atlas (cloud) — no local mongo service. Set MONGO_URI in .env
+    # to your Atlas connection string; Atlas Vector Search requires Atlas, so
+    # a local mongod container isn't an option for the catalog/RAG feature.

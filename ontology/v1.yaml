@@ -1,0 +1,114 @@
+# Canonical ontology, v1 — see ontology/PHASE3_ONTOLOGY.md for the full
+# field-to-path mapping table, instantiable-node rationale, versioning
+# decision, and known gaps (most resolved as of Phase 5 — see PHASE3_ONTOLOGY.md §4).
+#
+# This is data, not code: app/models.py's PartialContext/ContextGraph keep
+# their current Python-class shape until Phase 7 — nothing in the live turn
+# reads this file yet. app/canonical_mapper.py (Phase 5) is the first thing
+# that does, using each node type's `description` below as the target of an
+# embedding similarity search — see PHASE5_CANONICAL_MAPPER.md.
+#
+# Format: each top-level key is a node type. `description` is the text
+# embedded for type-inference matching. `children` lists the node types that
+# can nest under it (containment, not a field). `fields` lists the leaf
+# values a node of this type actually holds. `instantiable: true` means a
+# node of this type can exist zero-or-many times at runtime, keyed by an
+# opaque instance id (RoomContext.room_id today) rather than existing exactly
+# once like Budget or Timeline.
+
+version: 1
+versioning_policy: additive-only  # new node/field entries may be added; an existing canonical_path is never renamed, only deprecated — see PHASE3_ONTOLOGY.md
+
+Project:
+  description: The interior design project as a whole.
+  children: [BasicInformation, Budget, Timeline, Rooms, Requirements, Quotation, Unmapped]
+
+BasicInformation:
+  description: Basic identifying facts about the project, such as its type (new construction, renovation, refresh).
+  fields: [ProjectType]
+
+Budget:
+  description: The client's overall total budget across the whole project.
+  fields: [Total]
+
+Timeline:
+  description: The client's desired project timeline or completion schedule.
+  fields: [Value]
+
+Rooms:
+  description: A specific room or space within the project, such as a kitchen, bedroom, or living room.
+  instantiable: true  # one instance per room the client mentions — RoomContext.room_id today
+  fields: [RoomType, Budget, Style, SquareFootage, ExistingFurniture]
+  children: [Materials, Furniture, Attributes, Unmapped]
+
+Materials:
+  description: >
+    A material or finish choice for a specific surface or item in a room —
+    flooring, countertop, wall finish, paint, or similar — where both the
+    item and the material/finish chosen for it matter.
+  instantiable: true  # one instance per item — RoomContext.materials[i].item today
+  fields: [Label, Material, Specification]  # Label = the item's own name (e.g. "flooring"); see PHASE5_CANONICAL_MAPPER.md
+
+Furniture:
+  description: >
+    A physical furniture piece or fixture chosen for a room — a cabinet,
+    sofa, table, unit, or similar standalone item the client selects or
+    wants for the space.
+  instantiable: true  # freeform ContextGraph nodes of type "entity" land here — see PHASE3_ONTOLOGY.md
+  fields: [Label, Material, Notes]
+
+Attributes:
+  description: >
+    A general descriptive fact, detail, or note about a room or item that
+    doesn't fit a more specific category — a modifier, characteristic, or
+    freeform observation not itself a material, furniture piece,
+    constraint, or preference.
+  instantiable: true  # catch-all for freeform ContextGraph nodes of type "attribute" not yet re-homed to a more specific subtree
+  fields: [Label]
+
+Requirements:
+  description: Non-room-specific requirements and preferences for the project overall.
+  children: [Constraints, ClientPreferences]
+
+Constraints:
+  description: >
+    A hard limit, restriction, or must-have/must-avoid rule the client
+    stated — a non-negotiable boundary on the project, distinct from a mere
+    preference.
+  instantiable: true  # freeform ContextGraph nodes of type "constraint"
+  fields: [Label]
+
+ClientPreferences:
+  description: >
+    A stylistic or qualitative preference the client expressed — a mood,
+    color palette, design style, or taste-based want that isn't a hard
+    requirement.
+  instantiable: true  # freeform ContextGraph nodes of type "preference"
+  fields: [Label]
+
+# Resolves Gap 5 (ontology/PHASE3_ONTOLOGY.md): a freeform fact the canonical
+# mapper (Phase 5) can't confidently place under a more specific subtree.
+# Appears as a child of BOTH Project (no room context available at all) and
+# Rooms (a room IS known, but not which specific bucket within it — kept
+# room-scoped rather than losing that context) — see
+# app.canonical_mapper._container_path. Always flagged for human review; not
+# a permanent home.
+Unmapped:
+  description: >
+    A fact that could not be confidently placed under a more specific part
+    of the project — held here for review, not a final classification.
+  instantiable: true
+  fields: [Label]
+
+# Reserved for Phase 9 (Dependency Graph) and beyond — no current code
+# populates this subtree. Included now so a derives_from edge (e.g.
+# CabinetBudget derives_from KitchenBudget) has a defined target to point at
+# without a schema change when that phase starts.
+Quotation:
+  description: Reserved for future quote-generation output — not populated by any current extraction.
+  children: [RoomLineItems]
+
+RoomLineItems:
+  description: Reserved for a future per-room cost line item in a generated quotation.
+  instantiable: true
+  fields: [Amount, Basis]

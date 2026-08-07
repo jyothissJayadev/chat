@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+motor
+beanie
+langgraph
+instructor
+openai
+pydantic-settings
+python-dotenv
+langfuse
+rapidfuzz
+pyyaml
+pytest
+pytest-asyncio
