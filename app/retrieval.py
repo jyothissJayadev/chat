@@ -17,6 +17,7 @@ Not wired into the live turn — same standing as every module since Phase 1."""
 
 from rapidfuzz import fuzz
 
+from app import graph_store
 from app.models import KnowledgeNode
 
 _ROOM_MATCH_THRESHOLD = 70  # rapidfuzz 0-100 scale; same tool app/context_builder.py already uses for dedup
@@ -29,9 +30,7 @@ _DEFAULT_DEPTH = 2
 
 
 async def _existing_rooms(project_id: str) -> dict[str, str]:
-    leaves = await KnowledgeNode.find(
-        KnowledgeNode.project_id == project_id, KnowledgeNode.node_type == "RoomType", KnowledgeNode.lifecycle == "active"
-    ).to_list()
+    leaves = await graph_store.find_nodes(project_id, node_type="RoomType", lifecycle="active")
     return {leaf.room_id: str(leaf.value) for leaf in leaves if leaf.room_id and leaf.value is not None}
 
 
@@ -57,9 +56,7 @@ async def load_subtree(project_id: str, root_path: str, depth: int = _DEFAULT_DE
     segments deeper than root_path itself. root_path's own node is included
     (depth 0) when it exists."""
     root_depth = root_path.count(".")
-    nodes = await KnowledgeNode.find(
-        KnowledgeNode.project_id == project_id, KnowledgeNode.lifecycle == "active"
-    ).to_list()
+    nodes = await graph_store.find_nodes(project_id, lifecycle="active")
     return [
         n
         for n in nodes

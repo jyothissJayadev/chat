@@ -1,8 +1,9 @@
 """Task vocabulary produced by app.understanding.understand() and consumed by
 app.execution.execute() — see ARCHITECTURE_BASELINE.md, Phase 1/2. Each
-TaskType maps mechanically onto one of today's four intent labels (see
-app.understanding._INTENT_TO_TASK_TYPE); this is a relabeling of the
-existing classify_intent vocabulary, not a new classification scheme.
+TaskType maps mechanically onto one of app.llm.classify_operations'
+5 intent labels (see app.understanding._INTENT_TO_TASK_TYPE); this is a
+relabeling of that classifier's own vocabulary, not a new classification
+scheme.
 
 SAVE_CONTEXT is deliberately not included yet: the current system never
 distinguishes "first value for this field" from "edit to an existing value"
@@ -29,18 +30,37 @@ class TaskType(str, Enum):
 
 class TaskSpec(BaseModel):
     type: TaskType
-    # Clause/message text this task acts on — None means "the whole turn's
-    # message" (today's single-clause behavior, still the default; see
-    # app.understanding.segment_clauses). Populated per-clause once a message
-    # is segmented into more than one task.
+    # Mirrors app.llm.Operation.id ("op_1", "op_2", ...) — the key a
+    # later clarifying-question reply's operation_answers dict is matched
+    # against (see app.graph's pending_operation_questions branch). Defaults
+    # to "" only for hand-built TaskSpecs in tests that don't exercise that
+    # path; understanding.understand() always sets it.
+    op_id: str = ""
+    # This operation's own text, exactly as classify_operations split it out
+    # (app.understanding.understand always sets this now — never None; a
+    # single-operation turn's target is just that operation's own text,
+    # which classify_operations' own RULE 3 keeps close to the original
+    # message wording).
     target: Optional[str] = None
     # A raw room-TYPE NAME (e.g. "living room", "kitchen") — NOT a resolved
-    # room_id. app.understanding.segment_clauses (pure, DB-free, same as the
-    # rest of app.understanding) can only ever detect a room by name, never
-    # resolve it to an existing project's actual room_id; that resolution
-    # happens downstream, the same fuzzy-match-or-create path
-    # app.context_builder._resolve_room already runs for extracted.roomType
-    # (see build_context_node's room_hint handling) — a plain string, not a
-    # pre-resolved id, is what a caller with no DB access can produce, and
-    # what every consumer downstream actually needs to run through anyway.
+    # room_id; resolution happens downstream via the same fuzzy-match-or-create
+    # path app.context_builder._resolve_room runs for extracted.roomType (see
+    # build_context_node's room_hint handling). Never set by
+    # understanding.understand() itself (no auto-detection exists anymore —
+    # see the classifier-redesign-decisions and classifier-connection-plan
+    # memories for that history); app.execution._resolve_write_task and
+    # app.graph's delete/build_context paths derive this locally, per task,
+    # from connection instead (see app.canonical_mapper.split_connection) —
+    # this field stays on TaskSpec only as what those call sites pass
+    # through, not as something a caller is expected to set directly.
     room_hint: Optional[str] = None
+    # Mirrors app.llm.Operation.connection — the classifier's own
+    # grounding guess for this operation (a root-relative canonical path, a
+    # not-yet-existing entity name, or None). None here means the classifier
+    # couldn't place it: app.graph's pending_operation_questions branch asks
+    # the user directly rather than letting app.execution's resolve pass
+    # guess. Once set (by the classifier, or by a clarifying-question
+    # answer), app.execution._resolve_write_task treats it as an anchor hint
+    # into context_builder.resolve_context — never a final write path (see
+    # app.canonical_mapper.is_grounded_connection/room_id_from_connection).
+    connection: Optional[str] = None

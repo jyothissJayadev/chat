@@ -1,5 +1,6 @@
+from app import graph_store
 from app.dependency_graph import add_edge, find_dependents, recompute_dependents
-from app.models import KnowledgeEdge, KnowledgeNode
+from app.models import KnowledgeNode
 from app.versioning import get_version_history
 
 PROJECT = "proj-dep-1"
@@ -7,8 +8,7 @@ PROJECT = "proj-dep-1"
 
 async def _make_node(canonical_path: str, value, project_id: str = PROJECT) -> KnowledgeNode:
     node = KnowledgeNode(canonical_path=canonical_path, node_type="Total", value=value, project_id=project_id)
-    await node.insert()
-    return node
+    return await graph_store.insert_node(node)
 
 
 async def test_add_edge_is_idempotent():
@@ -19,7 +19,7 @@ async def test_add_edge_is_idempotent():
     edge2 = await add_edge(b.node_id, a.node_id, "derives_from", project_id)
 
     assert edge1.edge_id == edge2.edge_id
-    all_edges = await KnowledgeEdge.find(KnowledgeEdge.project_id == project_id).to_list()
+    all_edges = await graph_store.find_edges(project_id)
     assert len(all_edges) == 1
 
 
@@ -84,7 +84,7 @@ async def test_recompute_dependents_cascades_a_value_change_to_a_dependent():
 
     kitchen_budget.value = 30000
     kitchen_budget.version += 1
-    await kitchen_budget.save()
+    await graph_store.save_node(kitchen_budget)
 
     updated = await recompute_dependents(kitchen_budget, project_id, _fifteen_percent_of_parent)
 
@@ -92,7 +92,7 @@ async def test_recompute_dependents_cascades_a_value_change_to_a_dependent():
     assert updated[0].node_id == cabinet_budget.node_id
     assert updated[0].value == 4500.0
 
-    refreshed = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.node_id == cabinet_budget.node_id)
+    refreshed = await graph_store.find_by_node_id(cabinet_budget.node_id)
     assert refreshed.value == 4500.0
     assert refreshed.version == 2
 
@@ -112,7 +112,7 @@ async def test_recompute_dependents_skips_a_dependent_the_rule_declines_to_touch
     updated = await recompute_dependents(non_numeric_budget, project_id, _fifteen_percent_of_parent)
 
     assert updated == []
-    unchanged = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.node_id == cabinet_budget.node_id)
+    unchanged = await graph_store.find_by_node_id(cabinet_budget.node_id)
     assert unchanged.value == 1000
     assert unchanged.version == 1
 

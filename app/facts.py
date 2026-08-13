@@ -7,6 +7,7 @@ duplicate that write logic, it gives the read side — "which of these values
 came directly from the client" — a named, queryable home, per the plan's
 three-namespace split. See ontology/PHASE12_FACT_INFERENCE_CALCULATION.md."""
 
+from app import graph_store
 from app.models import KnowledgeNode
 
 
@@ -15,5 +16,5 @@ async def list_facts(project_id: str) -> list[KnowledgeNode]:
     changed_by="user_message" too — they're not "facts" in any meaningful
     sense, just scaffolding with no value of their own (see
     app.canonical_mapper.ensure_path) — excluded via value != None."""
-    nodes = await KnowledgeNode.find(KnowledgeNode.project_id == project_id, KnowledgeNode.changed_by == "user_message").to_list()
+    nodes = await graph_store.find_nodes(project_id, changed_by="user_message")
     return [n for n in nodes if n.value is not None]

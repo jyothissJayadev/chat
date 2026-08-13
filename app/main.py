@@ -8,6 +8,7 @@ from langfuse import get_client
 
 from app.chat import router as chat_router
 from app.database import close_mongo_connection, connect_to_mongo
+from app.neo4j_db import close_neo4j_connection, connect_to_neo4j
 from app.routes import router as routes_router
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
+    await connect_to_neo4j()
     yield
     await close_mongo_connection()
+    await close_neo4j_connection()
     get_client().flush()
 
 

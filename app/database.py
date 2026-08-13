@@ -7,7 +7,7 @@ from pymongo import ASCENDING, IndexModel
 from pymongo.errors import OperationFailure
 
 from app.config import settings
-from app.models import CatalogItem, ChatSession, KnowledgeEdge, KnowledgeNode, KnowledgeNodeVersion, ProjectContext
+from app.models import CatalogItem, ChatSession, ProjectContext
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +19,10 @@ async def connect_to_mongo() -> None:
     client = AsyncIOMotorClient(settings.mongo_uri)
     db = client[settings.mongo_db_name]
 
-    await init_beanie(
-        database=db,
-        document_models=[ChatSession, ProjectContext, CatalogItem, KnowledgeNode, KnowledgeNodeVersion, KnowledgeEdge],
-    )
+    # KnowledgeNode/KnowledgeNodeVersion/KnowledgeEdge (the knowledge graph)
+    # live in Neo4j now — see app/neo4j_db.py and app/graph_store.py. Mongo
+    # only holds dialogue mechanics and the catalog from here on.
+    await init_beanie(database=db, document_models=[ChatSession, ProjectContext, CatalogItem])
 
     await _ensure_indexes(db)
 
@@ -68,26 +68,6 @@ async def _ensure_indexes(db) -> None:
 
     catalog = db["catalog"]
     await catalog.create_indexes([IndexModel([("style_tags", ASCENDING)])])
-
-    knowledge_nodes = db["knowledge_nodes"]
-    await knowledge_nodes.create_indexes(
-        [
-            IndexModel("node_id", unique=True),
-            IndexModel([("project_id", 1), ("canonical_path", 1)]),
-            IndexModel([("parent_id", 1)]),
-            # Unused today (single-tenant) — indexed now per Phase 6's own
-            # rationale in app/models.py::KnowledgeNode.tenant_id.
-            IndexModel("tenant_id"),
-        ]
-    )
-
-    knowledge_node_versions = db["knowledge_node_versions"]
-    await knowledge_node_versions.create_indexes([IndexModel([("node_id", 1), ("version", 1)])])
-
-    knowledge_edges = db["knowledge_edges"]
-    await knowledge_edges.create_indexes(
-        [IndexModel([("project_id", 1), ("target_id", 1)]), IndexModel([("project_id", 1), ("source_id", 1)])]
-    )
 
     try:
         existing = [idx["name"] async for idx in catalog.list_search_indexes()]

@@ -23,7 +23,7 @@ async def test_infer_field_writes_with_inferred_provenance():
         return "150 sqft"
 
     project_id = "proj-taxonomy-inference"
-    with patch("app.deepinfra.infer_missing_field", side_effect=fake_infer):
+    with patch("app.llm.infer_missing_field", side_effect=fake_infer):
         node = await infer_field(project_id, "Project.Rooms.r1.SquareFootage", "SquareFootage", "square footage", {"roomType": "kitchen"}, room_id="r1")
 
     assert node.value == "150 sqft"
@@ -56,7 +56,7 @@ async def test_all_three_provenances_partition_a_projects_nodes_without_overlap(
         return "some inferred value"
 
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.BasicInformation.ProjectType", node_type="ProjectType", value="renovation", tier="critical")])
-    with patch("app.deepinfra.infer_missing_field", side_effect=fake_infer):
+    with patch("app.llm.infer_missing_field", side_effect=fake_infer):
         await infer_field(project_id, "Project.Timeline.Value", "Value", "timeline", {})
     await calculate_and_record(project_id, "Project.Budget.Total", "Total", 20000)
 

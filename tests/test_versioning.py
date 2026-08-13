@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import app.canonical_mapper as canonical_mapper
+from app import graph_store
 from app.canonical_mapper import map_to_canonical
 from app.context_builder import ProposedWrite, apply_to_graph
 from app.models import KnowledgeNode
@@ -28,7 +29,7 @@ async def test_changed_value_is_queryable_via_version_history():
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.Budget.Total", node_type="Total", value="$15k", tier="critical")])
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.Budget.Total", node_type="Total", value="$20k", tier="moderate")])
 
-    node = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == "Project.Budget.Total")
+    node = await graph_store.find_one(project_id, "Project.Budget.Total")
     history = await get_version_history(node.node_id)
 
     assert [h.value for h in history] == ["$15k", "$20k"]
@@ -42,7 +43,7 @@ async def test_unchanged_restated_value_produces_no_new_version_row():
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.Budget.Total", node_type="Total", value="$15k", tier="critical")])
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.Budget.Total", node_type="Total", value="$15k", tier="critical")])
 
-    node = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == "Project.Budget.Total")
+    node = await graph_store.find_one(project_id, "Project.Budget.Total")
     history = await get_version_history(node.node_id)
 
     assert node.version == 1, "restating an identical value must not bump version"
@@ -53,7 +54,7 @@ async def test_new_node_creation_produces_its_first_version_row():
     project_id = "proj-ver-create"
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.Rooms.r1.Style", node_type="Style", value="modern", room_id="r1", tier="moderate")])
 
-    node = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == "Project.Rooms.r1.Style")
+    node = await graph_store.find_one(project_id, "Project.Rooms.r1.Style")
     history = await get_version_history(node.node_id)
 
     assert len(history) == 1
@@ -65,10 +66,10 @@ async def test_new_node_creation_produces_its_first_version_row():
 async def test_freeform_node_creation_via_map_to_canonical_is_also_versioned():
     _reset_cache()
     project_id = "proj-ver-freeform"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         match = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
 
-    label = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == f"{match.canonical_path}.Label")
+    label = await graph_store.find_one(project_id, f"{match.canonical_path}.Label")
     history = await get_version_history(label.node_id)
 
     assert len(history) == 1
@@ -83,11 +84,11 @@ async def test_alias_reuse_and_embedding_backfill_do_not_create_spurious_version
     a version-history entry."""
     _reset_cache()
     project_id = "proj-ver-alias"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         first = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
         await map_to_canonical("couch", None, project_id, room_id=ROOM_ID)  # synonym -> alias reuse, not a new node
 
-    label = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == f"{first.canonical_path}.Label")
+    label = await graph_store.find_one(project_id, f"{first.canonical_path}.Label")
     history = await get_version_history(label.node_id)
 
     assert "couch" in label.aliases
@@ -96,8 +97,9 @@ async def test_alias_reuse_and_embedding_backfill_do_not_create_spurious_version
 
 
 async def test_record_version_captures_changed_by_and_source_message_id():
-    node = KnowledgeNode(canonical_path="Project.Budget.Total", node_type="Total", value="$15k", project_id="proj-ver-provenance", version=1)
-    await node.insert()
+    node = await graph_store.insert_node(
+        KnowledgeNode(canonical_path="Project.Budget.Total", node_type="Total", value="$15k", project_id="proj-ver-provenance", version=1)
+    )
 
     await record_version(node, changed_by="inferred", source_message_id="msg-123")
     history = await get_version_history(node.node_id)

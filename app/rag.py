@@ -1,4 +1,4 @@
-from app.deepinfra import embed
+from app.llm import embed
 from app.models import CatalogItem
 
 

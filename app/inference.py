@@ -1,6 +1,6 @@
 """Inference — Phase 12 (Fact/Inference/Calculation split). Relocates
-app.deepinfra.infer_missing_field's ROLE — not a copy of the function
-itself, deepinfra.py stays the one place LLM calls are made — into a named,
+app.llm.infer_missing_field's ROLE — not a copy of the function
+itself, llm.py stays the one place LLM calls are made — into a named,
 changed_by="inferred" write path.
 
 This gives app.context_builder's pipeline the terminal fallback
@@ -15,7 +15,7 @@ capability waiting for that caller."""
 
 from typing import Any, Optional
 
-from app import deepinfra
+from app import llm, graph_store
 from app.context_builder import ProposedWrite, apply_to_graph
 from app.models import KnowledgeNode
 
@@ -32,16 +32,16 @@ async def infer_field(
     distinct from canonical_path/node_type (where the answer is stored) —
     same split infer_missing_field's own (field_name, context) signature
     already has today."""
-    value = await deepinfra.infer_missing_field(field_label, context)
+    value = await llm.infer_missing_field(field_label, context)
     await apply_to_graph(
         project_id,
         [ProposedWrite(canonical_path=canonical_path, node_type=node_type, value=value, room_id=room_id, tier="optional", changed_by="inferred")],
     )
-    return await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == canonical_path)
+    return await graph_store.find_one(project_id, canonical_path)
 
 
 async def list_inferred(project_id: str) -> list[KnowledgeNode]:
     # No value != None filter needed here (unlike app.facts.list_facts):
     # ensure_path's structural containers always default to "user_message",
     # never "inferred" — nothing but a real inferred leaf can match this query.
-    return await KnowledgeNode.find(KnowledgeNode.project_id == project_id, KnowledgeNode.changed_by == "inferred").to_list()
+    return await graph_store.find_nodes(project_id, changed_by="inferred")

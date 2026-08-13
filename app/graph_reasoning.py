@@ -15,6 +15,7 @@ from typing import Optional
 from pydantic import BaseModel
 from rapidfuzz import fuzz
 
+from app import graph_store
 from app.dependency_graph import find_dependents
 from app.models import KnowledgeNode
 
@@ -64,9 +65,7 @@ async def rooms_exceeding_budget(project_id: str) -> list[RoomOverage]:
     a budget/amount that doesn't parse as a number are skipped, not guessed
     at — nothing populates RoomLineItems yet, so this is exercised with
     seeded test data, same as app.dependency_graph's worked example."""
-    nodes = await KnowledgeNode.find(
-        KnowledgeNode.project_id == project_id, KnowledgeNode.lifecycle == "active"
-    ).to_list()
+    nodes = await graph_store.find_nodes(project_id, lifecycle="active")
     budgets = {n.room_id: n.value for n in nodes if n.node_type == "Budget" and n.room_id}
     room_types = {n.room_id: n.value for n in nodes if n.node_type == "RoomType" and n.room_id}
 
@@ -91,9 +90,7 @@ async def rooms_exceeding_budget(project_id: str) -> list[RoomOverage]:
 async def rooms_with_material(project_id: str, material: str) -> list[RoomRef]:
     """Every room with a Materials.<item>.Material leaf fuzzy-matching
     `material`, one RoomRef per room (not per matching material leaf)."""
-    nodes = await KnowledgeNode.find(
-        KnowledgeNode.project_id == project_id, KnowledgeNode.lifecycle == "active"
-    ).to_list()
+    nodes = await graph_store.find_nodes(project_id, lifecycle="active")
     room_types = {n.room_id: n.value for n in nodes if n.node_type == "RoomType" and n.room_id}
 
     matched_room_ids: list[str] = []

@@ -18,6 +18,7 @@ app/execution.py (Phase 1)."""
 
 from typing import Awaitable, Callable, Optional
 
+from app import graph_store
 from app.models import KnowledgeEdge, KnowledgeEdgeRelation, KnowledgeNode
 from app.versioning import record_version
 
@@ -27,17 +28,11 @@ async def add_edge(source_id: str, target_id: str, relation: KnowledgeEdgeRelati
     returns the existing edge rather than creating a duplicate, same
     dedup convention update_context_graph_node already uses for
     (source, target, relation) triples."""
-    existing = await KnowledgeEdge.find_one(
-        KnowledgeEdge.project_id == project_id,
-        KnowledgeEdge.source_id == source_id,
-        KnowledgeEdge.target_id == target_id,
-        KnowledgeEdge.relation == relation,
-    )
+    existing = await graph_store.find_edge(project_id, source_id, target_id, relation)
     if existing is not None:
         return existing
     edge = KnowledgeEdge(source_id=source_id, target_id=target_id, relation=relation, project_id=project_id)
-    await edge.insert()
-    return edge
+    return await graph_store.insert_edge(edge)
 
 
 async def find_dependents(node_id: str, project_id: str, relation: Optional[KnowledgeEdgeRelation] = None) -> list[KnowledgeNode]:
@@ -46,17 +41,14 @@ async def find_dependents(node_id: str, project_id: str, relation: Optional[Know
     changes. Defaults to every relation; pass relation="derives_from" to
     scope to genuine dependency edges specifically (as recompute_dependents
     does) rather than e.g. "modifies" or "requires" edges, which describe a
-    relationship without implying a value should be recalculated."""
-    edges = await KnowledgeEdge.find(KnowledgeEdge.project_id == project_id, KnowledgeEdge.target_id == node_id).to_list()
-    if relation is not None:
-        edges = [e for e in edges if e.relation == relation]
-    if not edges:
-        return []
-    source_ids = {e.source_id for e in edges}
-    nodes = await KnowledgeNode.find(
-        KnowledgeNode.project_id == project_id, KnowledgeNode.lifecycle == "active"
-    ).to_list()
-    return [n for n in nodes if n.node_id in source_ids]
+    relationship without implying a value should be recalculated.
+
+    One graph traversal (graph_store.find_dependent_nodes) — the old
+    two-step "fetch matching edges, then fetch every active node in the
+    project and filter by source_id in Python" collapses into a single
+    Cypher MATCH, which is the actual payoff of the Neo4j move for this
+    module."""
+    return await graph_store.find_dependent_nodes(node_id, project_id, relation=relation)
 
 
 RecomputeFn = Callable[[KnowledgeNode, KnowledgeNode], Awaitable[Optional[object]]]
@@ -86,7 +78,7 @@ async def recompute_dependents(changed_node: KnowledgeNode, project_id: str, rec
             dependent.value = new_value
             dependent.changed_by = "system_default"
             dependent.version += 1
-            await dependent.save()
+            await graph_store.save_node(dependent)
             await record_version(dependent, changed_by="system_default")
             updated.append(dependent)
     return updated

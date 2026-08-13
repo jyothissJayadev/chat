@@ -3,7 +3,7 @@ criteria: the mapper must resolve a hand-built synonym set correctly, log
 (not silently drop) low-confidence creations, and never produce a
 canonical_path outside ontology/v1.yaml.
 
-deepinfra.embed is mocked with a small deterministic vector scheme (not real
+llm.embed is mocked with a small deterministic vector scheme (not real
 embeddings — there's no live model call in tests) built specifically so the
 REAL cosine-similarity/thresholding logic in canonical_mapper.py gets
 exercised, not just hand-asserted: every phrase's vector is
@@ -22,8 +22,8 @@ from unittest.mock import patch
 import pytest
 
 import app.canonical_mapper as canonical_mapper
+from app import graph_store
 from app.canonical_mapper import _FREEFORM_NODE_TYPES, _ONTOLOGY, map_to_canonical
-from app.models import KnowledgeNode
 
 _TYPE_AXIS_WEIGHT = 0.8
 _ENTITY_AXIS_WEIGHT = 0.6
@@ -117,7 +117,7 @@ async def test_golden_set_synonyms_resolve_to_the_same_node(entity_id, node_type
     project_id = f"proj-golden-{entity_id}"
     room_id = _room_for(node_type)
 
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         first = await map_to_canonical(phrases[0], None, project_id, room_id=room_id)
         assert first.node_type == node_type, f"{phrases[0]!r} should infer node_type={node_type}"
         assert first.created_new is True
@@ -130,7 +130,7 @@ async def test_golden_set_synonyms_resolve_to_the_same_node(entity_id, node_type
 
 async def test_different_entities_of_the_same_type_do_not_merge():
     project_id = "proj-golden-distinct-furniture"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         sofa = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
         wardrobe = await map_to_canonical("wardrobe", None, project_id, room_id=ROOM_ID)
 
@@ -140,7 +140,7 @@ async def test_different_entities_of_the_same_type_do_not_merge():
 
 async def test_exact_rematch_short_circuits_before_any_embedding_call():
     project_id = "proj-exact-rematch"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed) as mock_embed:
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed) as mock_embed:
         first = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
         # 2 calls for a brand-new node with no existing candidates: (1) the
         # query text itself, (2) the 5 type descriptions, embedded once and
@@ -161,13 +161,11 @@ async def test_existing_candidate_embedding_is_persisted_and_reused_not_recomput
     time — only the NEW query text costs an embedding call on a repeat
     lookup against an already-embedded candidate pool."""
     project_id = "proj-embedding-reuse"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed) as mock_embed:
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed) as mock_embed:
         first = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
         calls_after_first = mock_embed.await_count
 
-        label = await KnowledgeNode.find_one(
-            KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == f"{first.canonical_path}.Label"
-        )
+        label = await graph_store.find_one(project_id, f"{first.canonical_path}.Label")
         assert label.embedding is not None, "a newly-created node's embedding must be persisted, not left unset"
 
         # "couch" is a synonym of "sofa" — this call must score against
@@ -184,7 +182,7 @@ async def test_existing_candidate_embedding_is_persisted_and_reused_not_recomput
 
 async def test_node_type_hint_skips_type_inference_embedding():
     project_id = "proj-hint-test"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         # Deliberately NOT in the golden set — would raise in fake_embed if
         # type-inference embedding were attempted despite the hint. No
         # existing candidates for this fresh project either, so the
@@ -199,7 +197,7 @@ async def test_node_type_hint_skips_type_inference_embedding():
 
 async def test_low_confidence_mention_falls_back_to_unmapped_and_is_flagged():
     project_id = "proj-unmapped-test"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         match = await map_to_canonical(_LOW_CONFIDENCE_PHRASE, None, project_id, room_id=ROOM_ID)
 
     assert match.node_type == "Unmapped"
@@ -214,7 +212,7 @@ async def test_room_scoped_hint_without_room_id_falls_back_to_project_level_unma
     project-level Unmapped bucket instead of being silently dropped or
     guessed into the wrong room."""
     project_id = "proj-unmapped-no-room"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         match = await map_to_canonical("some furniture thing", "Furniture", project_id, room_id=None)
 
     assert match.node_type == "Unmapped"
@@ -237,12 +235,12 @@ async def test_never_produces_a_node_type_outside_the_ontology():
     project_id = "proj-ontology-fidelity"
     valid_node_types = _all_valid_node_types()
 
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
         await map_to_canonical("quartz countertop", None, project_id, room_id=ROOM_ID)
         await map_to_canonical(_LOW_CONFIDENCE_PHRASE, None, project_id, room_id=ROOM_ID)
 
-    nodes = await KnowledgeNode.find(KnowledgeNode.project_id == project_id).to_list()
+    nodes = await graph_store.find_nodes(project_id)
     assert len(nodes) > 3, "expected container-chain nodes plus each instance and its Label leaf"
     for node in nodes:
         assert node.node_type in valid_node_types, f"{node.node_type!r} is not a real ontology/v1.yaml node type or field"
@@ -250,12 +248,118 @@ async def test_never_produces_a_node_type_outside_the_ontology():
 
 async def test_created_instance_has_a_findable_label_leaf():
     project_id = "proj-label-leaf"
-    with patch("app.canonical_mapper.deepinfra.embed", side_effect=fake_embed):
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
         match = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
 
-    label = await KnowledgeNode.find_one(
-        KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == f"{match.canonical_path}.Label"
-    )
+    label = await graph_store.find_one(project_id, f"{match.canonical_path}.Label")
     assert label is not None
     assert label.value == "sofa"
     assert label.parent_id == match.node_id
+
+
+# ---------------------------------------------------------------------------
+# commit=False — the resolve-only preview app.context_builder.resolve_context
+# uses (Step 2 of the classifier-redesign plan). A preview must describe
+# exactly what a real commit=True call would do, without actually creating
+# anything, so a caller can safely use it purely for clustering decisions.
+# ---------------------------------------------------------------------------
+
+
+async def test_preview_of_a_new_entity_creates_nothing():
+    project_id = "proj-preview-no-write"
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        preview = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID, commit=False)
+
+    assert preview.created_new is True
+    assert preview.node_id == "", "nothing was actually created, so there's no real node id yet"
+    assert preview.canonical_path == f"Project.Rooms.{ROOM_ID}.Furniture.sofa"
+    nodes = await graph_store.find_nodes(project_id)
+    assert not any(n.node_type == "Label" for n in nodes), "commit=False must not create the instance/Label leaves"
+
+
+async def test_preview_path_matches_what_a_later_commit_actually_creates():
+    project_id = "proj-preview-matches-commit"
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        preview = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID, commit=False)
+        committed = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID, commit=True)
+
+    assert committed.canonical_path == preview.canonical_path
+    assert committed.node_type == preview.node_type
+    assert committed.created_new is True
+
+
+async def test_preview_of_an_already_existing_entity_matches_without_creating_a_duplicate():
+    project_id = "proj-preview-existing"
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        first = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
+        preview = await map_to_canonical("couch", None, project_id, room_id=ROOM_ID, commit=False)
+
+    assert preview.created_new is False
+    assert preview.matched_via == "alias_embedding"
+    assert preview.node_id == first.node_id
+    assert preview.canonical_path == first.canonical_path
+
+
+async def test_preview_of_a_low_confidence_mention_previews_the_unmapped_path():
+    project_id = "proj-preview-unmapped"
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        preview = await map_to_canonical(_LOW_CONFIDENCE_PHRASE, None, project_id, room_id=ROOM_ID, commit=False)
+
+    assert preview.node_type == "Unmapped"
+    assert preview.matched_via == "unmapped"
+    assert preview.flagged_for_review is True
+    assert preview.canonical_path == f"Project.Rooms.{ROOM_ID}.Unmapped.something_completely_ambiguous"
+    nodes = await graph_store.find_nodes(project_id)
+    assert not any(n.node_type == "Label" for n in nodes)
+
+
+# ---------------------------------------------------------------------------
+# is_grounded_connection / room_id_from_connection / split_connection —
+# app.llm.Operation.connection's shape reasoning, shared by
+# app.execution's write clustering and app.graph's delete-target resolution.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "connection,expected",
+    [
+        ("Rooms.a1b2c3d4", True),
+        ("Rooms.a1b2c3d4.Materials.countertop", True),
+        ("BasicInformation.ProjectType", True),
+        ("Project", True),
+        ("Living Room", False),
+        ("Kids Bedroom", False),
+    ],
+)
+def test_is_grounded_connection(connection, expected):
+    assert canonical_mapper.is_grounded_connection(connection) is expected
+
+
+@pytest.mark.parametrize(
+    "connection,expected_room_id",
+    [
+        ("Rooms.a1b2c3d4", "a1b2c3d4"),
+        ("Rooms.a1b2c3d4.Materials.countertop", "a1b2c3d4"),
+        ("Project", None),
+        ("Budget.Total", None),
+        ("Living Room", None),
+    ],
+)
+def test_room_id_from_connection(connection, expected_room_id):
+    assert canonical_mapper.room_id_from_connection(connection) == expected_room_id
+
+
+def test_split_connection_grounded_room_path_yields_room_id_override_only():
+    room_id, room_hint = canonical_mapper.split_connection("Rooms.a1b2c3d4.Furniture.island")
+    assert room_id == "a1b2c3d4"
+    assert room_hint is None
+
+
+def test_split_connection_free_text_yields_room_hint_override_only():
+    room_id, room_hint = canonical_mapper.split_connection("Living Room")
+    assert room_id is None
+    assert room_hint == "Living Room"
+
+
+def test_split_connection_none_yields_no_overrides():
+    assert canonical_mapper.split_connection(None) == (None, None)

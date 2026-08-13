@@ -14,6 +14,7 @@ hand, not recomputed every time some upstream node changes)."""
 
 from typing import Any, Optional
 
+from app import graph_store
 from app.context_builder import ProposedWrite, apply_to_graph
 from app.models import KnowledgeNode
 
@@ -25,11 +26,11 @@ async def calculate_and_record(
         project_id,
         [ProposedWrite(canonical_path=canonical_path, node_type=node_type, value=value, room_id=room_id, tier="optional", changed_by="system_default")],
     )
-    return await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == canonical_path)
+    return await graph_store.find_one(project_id, canonical_path)
 
 
 async def list_calculated(project_id: str) -> list[KnowledgeNode]:
     # No value != None filter needed here (unlike app.facts.list_facts):
     # ensure_path's structural containers always default to "user_message",
     # never "system_default" — nothing but a real calculated leaf matches this.
-    return await KnowledgeNode.find(KnowledgeNode.project_id == project_id, KnowledgeNode.changed_by == "system_default").to_list()
+    return await graph_store.find_nodes(project_id, changed_by="system_default")

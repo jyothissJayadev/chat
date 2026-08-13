@@ -48,13 +48,9 @@ FIELD_TIERS: dict[str, Literal["critical", "moderate", "optional"]] = {
     "materials": "optional",
 }
 
-# Rephrases allowed AFTER the first ask — e.g. "critical": 3 means up to 4
-# total asks (1 original + 3 rephrases) before the field is marked "skipped".
-RETRY_LIMITS: dict[str, int] = {"critical": 3, "moderate": 1, "optional": 0}
-
 # Human-readable form of a field name — used anywhere a field needs to be
 # named in a message shown to a user or fed into an LLM prompt (confirmation
-# summaries, classify_intent's pending-question context, save_project's
+# summaries, classify_operations' pending-question context, save_project's
 # assumption notes). Shared across app/graph.py and app/understanding.py, so
 # it lives here rather than in either.
 FIELD_LABELS: dict[str, str] = {
@@ -127,19 +123,36 @@ class ChatSession(Document):
     messages: list[Message] = Field(default_factory=list)
     trace: list[TraceEntry] = Field(default_factory=list)
     status: Literal["in_progress", "complete"] = "in_progress"
-    active_room_id: Optional[str] = None
-    # Retry counters for declined questions, keyed by canonical_path — see
-    # app.graph.decline_field_node. Dialogue mechanics, not a project fact,
-    # so it lives here rather than on a KnowledgeNode.
-    field_attempts: dict[str, int] = Field(default_factory=dict)
-    # Serialized app.question_engine.KnowledgeGap for the currently pending
-    # question, if any — lets the next turn attribute a decline to the right
-    # field (and know its tier) without re-deriving it.
+    # Rooms currently deprioritized by a decline — see
+    # app.graph.classify_intent_node's decline-detection step and
+    # app.question_engine.find_knowledge_gap's two-pass breadth-first walk.
+    skipped_rooms: list[str] = Field(default_factory=list)
+    # {"canonical_path", "room_id"} for the field the LAST question was
+    # about — written only by app.graph.generate_question_node, read only by
+    # classify_intent_node. Dialogue mechanics, not a project fact, so it
+    # lives here rather than on a KnowledgeNode.
+    current_field: Optional[dict] = None
+    # Serialized app.question_engine.KnowledgeGapBatch for the currently open
+    # gap(s) — a room's whole open-field batch, or a single project-level
+    # gap. Written by build_context_node right after a value commits, and by
+    # generate_question_node right after it computes the batch it's about to
+    # ask about — no other node reads or writes this. See PENDING_GAP_ANALYSIS.md.
     pending_gap: Optional[dict] = None
-    # Serialized app.context_builder.Conflict awaiting a yes/no reply — set
-    # when a critical-tier field's value would change; see app.graph's
-    # confirm_conflict_node.
-    pending_confirmation: Optional[dict] = None
+    # Which room a batched question/write is currently focused on — a
+    # narrower, newer concept than the old removed active_room_id (see
+    # PENDING_GAP_ANALYSIS.md §7): this one drives ONLY which room's open
+    # fields get batched into the next question, never where a write lands
+    # (that's still exclusively task.connection/room_hint). Set by
+    # app.graph.classify_intent_node from the resolved room of the LAST
+    # EDIT_CONTEXT/DELETE_CONTEXT/RETRIEVE_CONTEXT task in a turn, and
+    # auto-advanced by app.question_engine.find_knowledge_gaps once the
+    # current active room has nothing left open.
+    active_room_id: Optional[str] = None
+    # Set when classify_operations returned a write task with connection=
+    # None — one clarifying question per unresolved operation, answered
+    # together via the next request's ChatRequest.operation_answers. See
+    # app.graph.classify_intent_node / GraphState.pending_operation_questions.
+    pending_operation_questions: Optional[dict] = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -177,7 +190,7 @@ class ProjectContext(Document):
 ChangedBy = Literal["user_message", "inferred", "system_default"]
 
 
-class KnowledgeNode(Document):
+class KnowledgeNode(BaseModel):
     """One node in the canonical knowledge tree — see ontology/v1.yaml and
     ontology/PHASE3_ONTOLOGY.md for the schema canonical_path values are
     drawn from. The live source of truth for every project fact — written
@@ -185,25 +198,34 @@ class KnowledgeNode(Document):
     app.context_builder/app.canonical_mapper), not PartialContext/ContextGraph,
     which this replaced (see ARCHITECTURE_BASELINE.md).
 
-    node_id (not `id`) is the business key parent_id/children_ids reference —
-    same "leave Beanie's own `id`/ObjectId alone, add a separate uuid business
-    key" pattern ChatSession.session_id/ProjectContext.project_id/
-    CatalogItem.item_id already use, kept for consistency rather than
-    overriding `id` itself as the plan's own sketch does."""
+    Lives in Neo4j, not Mongo (see app/graph_store.py) — this is a plain
+    Pydantic DTO hydrated from a Cypher result, not a Beanie Document. A
+    :KNode node's own graph-native properties are exactly this model's
+    fields minus `parent_id`, which is derived per read from the node's
+    outgoing :CHILD_OF relationship rather than stored as a property (a
+    real edge, not a denormalized string, is the whole point of the move).
+    There's no `children_ids` field either — walk :CHILD_OF the other
+    direction (see graph_store.descendant_ids) instead of maintaining a
+    parallel list that could drift from the actual relationships.
+
+    node_id (not `id`) is the business key other nodes' CHILD_OF edges and
+    KnowledgeEdge rows reference — same pattern
+    ChatSession.session_id/ProjectContext.project_id/CatalogItem.item_id
+    already use."""
 
     node_id: str = Field(default_factory=lambda: uuid4().hex)
     canonical_path: str
     parent_id: Optional[str] = None
-    children_ids: list[str] = Field(default_factory=list)
     # Matches a node type name in ontology/v1.yaml, e.g. "Rooms", "Materials",
     # "ProjectType".
     node_type: str
     value: Optional[Any] = None
     aliases: list[str] = Field(default_factory=list)
     confidence: float = 1.0
-    # "skipped" never actually lands here: app.graph.decline_field_node calls
-    # app.inference.infer_field the moment a field's retry budget is
-    # exhausted, so a node's status is always "confirmed" or "assumed".
+    # "skipped" never actually lands here — a declined room-scoped field is
+    # tracked via ChatSession.skipped_rooms instead (see
+    # app.graph.classify_intent_node's decline-detection), not on the node
+    # itself, so a node's status is always "confirmed" or "assumed".
     status: FieldStatus = "confirmed"
     # Deletion lifecycle (app.graph.delete_context_node / app.versioning.retract_node)
     # — deliberately a separate field from `status` above, which tracks
@@ -232,31 +254,32 @@ class KnowledgeNode(Document):
     # it lazily the first time such a node is considered as a candidate.
     embedding: Optional[list[float]] = None
     # Unused today — this system has exactly one tenant. Added now, indexed
-    # (see app/database.py), because retrofitting tenant scoping onto an
-    # already-growing collection later is materially harder than shipping an
-    # unused column today (Phase 6 of the implementation plan's own call).
+    # (see app/neo4j_db.py), because retrofitting tenant scoping onto an
+    # already-growing graph later is materially harder than shipping an
+    # unused property today (Phase 6 of the implementation plan's own call).
     tenant_id: Optional[str] = None
     version: int = 1
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
-    class Settings:
-        name = "knowledge_nodes"
 
-
-class KnowledgeNodeVersion(Document):
+class KnowledgeNodeVersion(BaseModel):
     """Append-only history of every value a KnowledgeNode has held — same
     shape/purpose as TraceEntry's existing append-only pattern for turn
-    history above, just a separate collection since this outlives a single
-    chat turn. Written only by app/versioning.py::record_version(), never
-    mutated once inserted — see ontology/PHASE8_VERSIONING.md."""
+    history above, just a separate set of :KNodeVersion nodes in Neo4j since
+    this outlives a single chat turn. Written only by
+    app/versioning.py::record_version(), never mutated once inserted — see
+    ontology/PHASE8_VERSIONING.md. No relationship back to its KnowledgeNode
+    (unlike KNode's own :CHILD_OF edges) — every read path queries by
+    `node_id` property directly (indexed, see app/neo4j_db.py), so a graph
+    edge would add nothing a property lookup doesn't already give for free."""
 
     node_id: str
     version: int
     value: Optional[Any] = None
     changed_at: datetime = Field(default_factory=utcnow)
     # "user_message": stated directly by the client this turn. "inferred":
-    # an LLM's best-guess fallback (app.deepinfra.infer_missing_field's role
+    # an LLM's best-guess fallback (app.llm.infer_missing_field's role
     # today, not yet ported to this pipeline — see PHASE8_VERSIONING.md).
     # "system_default": a deterministic, non-LLM default. Only "user_message"
     # is actually produced by any code path as of Phase 8 — the other two
@@ -264,9 +287,6 @@ class KnowledgeNodeVersion(Document):
     # not placeholders invented here.
     changed_by: ChangedBy = "user_message"
     source_message_id: Optional[str] = None
-
-    class Settings:
-        name = "knowledge_node_versions"
 
 
 # GraphRelation (above) minus part_of/located_in — those are superseded by
@@ -278,12 +298,14 @@ KnowledgeEdgeRelation = Literal[
 ]
 
 
-class KnowledgeEdge(Document):
+class KnowledgeEdge(BaseModel):
     """A non-hierarchical relationship between two KnowledgeNodes — see
     ontology/PHASE9_DEPENDENCY_GRAPH.md. Containment ("this is in the
     kitchen") is never represented here; canonical_path already expresses
-    it. New collection (knowledge_edges), not yet written by any live turn —
-    see app/dependency_graph.py."""
+    it. Stored as a real Neo4j relationship (a single generic `:REL` type
+    carrying `relation` as a property, rather than one Neo4j relationship
+    type per KnowledgeEdgeRelation value — see app/graph_store.py for why),
+    not yet written by any live turn — see app/dependency_graph.py."""
 
     edge_id: str = Field(default_factory=lambda: uuid4().hex)
     source_id: str  # KnowledgeNode.node_id
@@ -291,9 +313,6 @@ class KnowledgeEdge(Document):
     relation: KnowledgeEdgeRelation
     project_id: str
     created_at: datetime = Field(default_factory=utcnow)
-
-    class Settings:
-        name = "knowledge_edges"
 
 
 class CatalogItem(Document):

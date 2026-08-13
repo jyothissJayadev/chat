@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 motor
 beanie
+neo4j
 langgraph
 instructor
 openai

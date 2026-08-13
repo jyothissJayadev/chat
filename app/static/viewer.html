@@ -176,6 +176,23 @@
   .msg .role { font-size: 10px; text-transform: uppercase; color: #888; margin-bottom: 3px; }
   .empty { color: #555; font-size: 13px; font-style: italic; }
   .msg.pending { opacity: 0.7; }
+  /* Clarifying-question options (app.chat's operation_questions SSE event —
+     see app.graph._generate_operation_questions). For now this only renders
+     the LLM-provided fixed option buttons, no free-text input yet (that's
+     the "allow_custom" affordance the event also carries — a later pass). */
+  .op-options { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .op-option-btn {
+    padding: 5px 10px;
+    background: #263042;
+    border: 1px solid #37455c;
+    color: #cfe0ff;
+    border-radius: 14px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .op-option-btn:hover:not(:disabled) { background: #31405a; }
+  .op-option-btn:disabled { opacity: 0.5; cursor: default; }
+  .op-option-btn.chosen { background: #2b6cb0; border-color: #2b6cb0; color: #fff; }
   .graph-panel {
     display: flex;
     flex-direction: column;
@@ -315,7 +332,7 @@ function renderSectionHeading(el, text) {
 
 // nodes: the flat KnowledgeNode list from GET /sessions/{id}/state
 // ("knowledge_nodes") — see app/routes.py. session: the same response, for
-// its active_room_id/pending_gap/pending_confirmation fields.
+// its current_field/skipped_rooms/pending_gap/pending_confirmation fields.
 function renderContext(nodes, session) {
   const el = document.getElementById('contextPanel');
   el.innerHTML = '';
@@ -345,11 +362,12 @@ function renderContext(nodes, session) {
     rooms.forEach((room, i) => {
       const roomId = room.canonical_path.split('.').pop();
       const prefix = room.canonical_path;
-      const isActive = roomId === session.active_room_id;
+      const isActive = roomId === (session.current_field && session.current_field.room_id);
+      const isSkipped = (session.skipped_rooms || []).includes(roomId);
       const roomType = valueAt(`${prefix}.RoomType`);
       const roomHeading = document.createElement('div');
       roomHeading.style.cssText = 'font-weight: 600; color: #d7d7d7; margin: 10px 0 2px; font-size: 13px;';
-      roomHeading.textContent = (roomType || `Room ${i + 1}`) + (isActive ? ' (active)' : '');
+      roomHeading.textContent = (roomType || `Room ${i + 1}`) + (isActive ? ' (asking)' : '') + (isSkipped ? ' (skipped)' : '');
       el.appendChild(roomHeading);
 
       renderField(el, 'room type', roomType);
@@ -853,18 +871,70 @@ function appendLiveMessage(role, content) {
 // the authoritative list once loadSession() runs at the end of the turn.
 let liveTrace = [];
 
-async function sendMessage() {
-  const input = document.getElementById('chatInput');
-  const message = input.value.trim();
-  if (!message) return;
-  input.value = '';
+// Renders one assistant bubble per clarifying question from an
+// operation_questions SSE event (see app.chat.run_chat_turn's docstring and
+// app.graph._generate_operation_questions), each question line-up followed
+// by a row of buttons — one per LLM-provided option label. Clicking a
+// button answers just that op_id (app.graph.classify_intent_node's resume
+// path already supports a partial answer: only the still-unresolved ops in
+// the batch get re-asked, see tests/test_graph.py's reasks test), so
+// multiple questions in one batch are answered one click at a time rather
+// than requiring every option to be picked before anything submits.
+//
+// For now this only renders the fixed option buttons the model proposed —
+// no free-text input yet, even though the event's `allow_custom: true`
+// signals the API already accepts a typed answer for any op_id (a later
+// pass can add a text field alongside these buttons).
+function renderOperationQuestions(questions) {
+  const el = document.getElementById('conversationPanel');
+  if (el.querySelector('.empty')) el.innerHTML = '';
+  (questions || []).forEach((q) => {
+    const div = document.createElement('div');
+    div.className = 'msg assistant';
+    div.innerHTML = `<div class="role">assistant</div><div class="content"></div>`;
+    div.querySelector('.content').textContent = q.question;
+
+    const options = document.createElement('div');
+    options.className = 'op-options';
+    (q.options || []).forEach((opt) => {
+      const btn = document.createElement('button');
+      btn.className = 'op-option-btn';
+      btn.textContent = opt.label;
+      btn.addEventListener('click', () => submitOperationAnswer(q.op_id, opt.label, options));
+      options.appendChild(btn);
+    });
+    div.appendChild(options);
+
+    el.appendChild(div);
+  });
+  el.scrollTop = el.scrollHeight;
+}
+
+// Answers ONE op_id from a rendered operation_questions batch and resumes
+// the turn — see app.chat.ChatRequest.operation_answers ({op_id: chosen_value},
+// here always an option's own label). message is deliberately empty: the
+// resume path reads pending_operation_questions/operation_answers off the
+// session, not the message text (app.graph.classify_intent_node).
+async function submitOperationAnswer(opId, label, optionsRowEl) {
+  [...optionsRowEl.querySelectorAll('.op-option-btn')].forEach((b) => {
+    b.disabled = true;
+    if (b.textContent === label) b.classList.add('chosen');
+  });
+
+  const sid = document.getElementById('sessionId').value.trim() || null;
+  appendLiveMessage('user', label);
+  await streamChatEvents(sid ? { session_id: sid, message: '', operation_answers: { [opId]: label } } : { message: '', operation_answers: { [opId]: label } });
+}
+
+// Shared SSE consumption for both a typed message (sendMessage) and a
+// clarifying-question answer (submitOperationAnswer) — fetches /chat,
+// streams the event-per-line body, and dispatches each event onto the
+// conversation/trace panels. See app.chat.run_chat_turn's docstring for the
+// full event catalog.
+async function streamChatEvents(body) {
   document.getElementById('sendBtn').disabled = true;
   setStatus('sending...');
 
-  const sid = document.getElementById('sessionId').value.trim() || null;
-  const body = sid ? { session_id: sid, message } : { message };
-
-  appendLiveMessage('user', message);
   const liveAssistant = appendLiveMessage('assistant', '');
   let answerText = '';
 
@@ -914,6 +984,13 @@ async function sendMessage() {
           // held it back pending a yes/no reply instead of silently
           // overwriting (see app.context_builder.detect_conflicts).
           appendLiveMessage('assistant', evt.question);
+        } else if (evt.type === 'operation_questions') {
+          // classify_intent_node held the whole write batch back — at least
+          // one op's graph connection is still null and the model judged
+          // the ambiguity real (see app.graph._generate_operation_questions).
+          // Nothing writes until every question below is answered.
+          if (!answerText) liveAssistant.remove();
+          renderOperationQuestions(evt.questions);
         } else if (evt.type === 'wrapup') {
           // Closing statement sent once the intake completes — same
           // pending-bubble handling as context_updated above, since this
@@ -937,6 +1014,19 @@ async function sendMessage() {
     document.getElementById('sendBtn').disabled = false;
     await loadSession();
   }
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = '';
+
+  const sid = document.getElementById('sessionId').value.trim() || null;
+  const body = sid ? { session_id: sid, message } : { message };
+
+  appendLiveMessage('user', message);
+  await streamChatEvents(body);
 }
 
 document.getElementById('loadBtn').addEventListener('click', loadSession);

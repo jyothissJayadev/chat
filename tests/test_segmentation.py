@@ -1,75 +1,23 @@
-"""Coverage for multi-clause/multi-room segmentation — Fix 2 of the
-deletion-support plan (C:\\Users\\jyoth\\.claude\\plans\\lexical-gliding-clarke.md).
-
-Covers: segment_clauses' boundary/room_hint behavior on a table of real
-sentences (including the original transcript's failing multi-room message),
-the single-room regression (segmentation must not fire on an ordinary list
-within one room), a full understand() -> execution.execute() run proving
-writes land under the CORRECT room's subtree, and a direct regression test
-for the execute() dispatch bug Fix 2 exposed (Correction 3 — two tasks of the
-same type used to silently collapse into one)."""
+"""Coverage for multi-operation turns spanning more than one room — originally
+written for Fix 2 of the deletion-support plan
+(C:\\Users\\jyoth\\.claude\\plans\\lexical-gliding-clarke.md), which added a
+regex room-splitter (segment_clauses) ahead of the single-label classifier of
+the time. That splitter is gone — app.llm.classify_operations now does
+its own multi-operation splitting directly (see
+tests/test_understanding.py's golden set for its own room-split coverage) —
+but the behaviors this file guards are still real: a full understand() ->
+execution.execute() run proving writes land under the CORRECT room's
+subtree, and a direct regression test for the execute() dispatch bug Fix 2
+originally exposed (Correction 3 — two tasks of the same type used to
+silently collapse into one)."""
 
 from unittest.mock import patch
 
-import pytest
-
-from app.deepinfra import ExtractedFields, GraphExtraction, MaterialSpec
+from app import graph_store
+from app.llm import ExtractedFields, GraphExtraction, MaterialSpec
 from app.execution import execute
-from app.models import KnowledgeNode
 from app.tasks import TaskSpec, TaskType
-from app.understanding import segment_clauses, understand
-
-# ---------------------------------------------------------------------------
-# segment_clauses — pure, no DB, table-driven.
-# ---------------------------------------------------------------------------
-
-_CASES = [
-    (
-        "add sofa and couch, tv to living room and let's update the kitchen with a kitchen cabinet and a ceiling fan",
-        ["living room", "kitchen"],
-    ),
-    ("modern style with a chair, sofa set and a tv unit", [None]),
-    ("quartz countertops please", [None]),
-    ("remove the ceiling fan from the list", [None]),
-    ("the kitchen needs a new sink and the bedroom needs a new bed", ["kitchen", "bedroom"]),
-    ("$15k for the kitchen, $8k for the bathroom, and $5k for the guest room", ["kitchen", "bathroom", "guest room"]),
-]
-
-
-@pytest.mark.parametrize("message,expected_room_hints", _CASES)
-def test_segment_clauses_room_hints(message, expected_room_hints):
-    clauses = segment_clauses(message)
-    assert [c.room_hint for c in clauses] == expected_room_hints
-
-
-def test_segment_clauses_does_not_fire_on_a_single_room_item_list():
-    """The regression this guards against: an ordinary list of items within
-    ONE room ("chair, sofa set and a tv unit") must never be mis-split into
-    several fake per-item clauses — segmentation only fires on genuinely
-    DIFFERENT rooms, never on "and" alone. Item-level list parsing stays
-    extract_fields' own job."""
-    clauses = segment_clauses("modern style with a chair, sofa set and a tv unit")
-    assert len(clauses) == 1
-    assert clauses[0].text == "modern style with a chair, sofa set and a tv unit"
-
-
-def test_segment_clauses_repeated_mention_of_an_already_seen_room_does_not_reopen_a_boundary():
-    clauses = segment_clauses("kitchen needs a sink, and later also fix the kitchen tap, and the bedroom needs paint")
-    room_hints = [c.room_hint for c in clauses]
-    # Exactly two boundaries (kitchen's FIRST mention, bedroom's) — the
-    # second "kitchen" mention folds into the still-open kitchen clause
-    # rather than opening a third.
-    assert room_hints == ["kitchen", "bedroom"]
-    assert "kitchen tap" in clauses[0].text
-
-
-def test_segment_clauses_trailing_fragment_without_its_own_room_name_inherits_the_preceding_room():
-    clauses = segment_clauses("the kitchen needs a sink and the living room needs a rug and a lamp")
-    assert [c.room_hint for c in clauses] == ["kitchen", "living room"]
-    # "and a lamp" has no room name of its own — it stays part of the
-    # still-open living room clause rather than becoming an orphaned clause.
-    assert "lamp" in clauses[-1].text
-
+from app.understanding import understand
 
 # ---------------------------------------------------------------------------
 # understand() -> execution.execute() — writes land under the correct room.
@@ -79,15 +27,27 @@ def test_segment_clauses_trailing_fragment_without_its_own_room_name_inherits_th
 def base_state(message: str, project_id: str = "proj-seg-e2e") -> dict:
     return {
         "session_id": "test-session", "project_id": project_id, "message": message, "history": "",
-        "active_room_id": None, "field_attempts": {}, "intent": [], "tasks": [],
+        "skipped_rooms": [], "current_field": None, "intent": [], "tasks": [],
         "retrieved": "", "pending_question": None, "pending_gap": None, "pending_confirmation": None,
         "update_summary": None, "answer": "", "complete": False, "needs_answer": False,
         "question_generated": False, "wrapup_message": None, "trace": [],
     }
 
 
-async def fake_classify_update_context(message, history="", pending_field=None, **kwargs):
-    return ["update_context"]
+async def fake_classify_operations_by_room(message, history="", pending_field=None, **kwargs):
+    """Stands in for app.llm.classify_operations in the e2e test below —
+    splits a two-room message into two CONTEXT_UPDATE operations the same way
+    the real classifier's RULE 1/RULE 11 would, so the test can exercise
+    understand() -> execute() without a live LLM call."""
+    from app.llm import Operation
+
+    return [
+        Operation(text="add sofa and couch to living room", intent="CONTEXT_UPDATE"),
+        Operation(
+            text="update the kitchen with a kitchen cabinet and a ceiling fan",
+            intent="CONTEXT_UPDATE",
+        ),
+    ]
 
 
 async def fake_extract_fields_by_room(message, known, **kwargs):
@@ -112,16 +72,16 @@ async def test_multi_room_message_writes_each_rooms_facts_under_its_own_subtree(
     message = "add sofa and couch to living room and let's update the kitchen with a kitchen cabinet and a ceiling fan"
 
     with (
-        patch("app.deepinfra.classify_intent", side_effect=fake_classify_update_context),
-        patch("app.deepinfra.extract_fields", side_effect=fake_extract_fields_by_room),
-        patch("app.deepinfra.extract_graph_links", side_effect=fake_extract_graph_links),
+        patch("app.llm.classify_operations", side_effect=fake_classify_operations_by_room),
+        patch("app.llm.extract_fields", side_effect=fake_extract_fields_by_room),
+        patch("app.llm.extract_graph_links", side_effect=fake_extract_graph_links),
     ):
         meaning = await understand(message)
-        assert len(meaning.tasks) == 2, "one EDIT_CONTEXT task per room clause"
+        assert len(meaning.tasks) == 2, "one EDIT_CONTEXT task per room operation"
 
         result = await execute(meaning.tasks, base_state(message, project_id))
 
-    nodes = await KnowledgeNode.find(KnowledgeNode.project_id == project_id).to_list()
+    nodes = await graph_store.find_nodes(project_id)
     living_room_id = next(n.room_id for n in nodes if n.node_type == "RoomType" and n.value == "living room")
     kitchen_id = next(n.room_id for n in nodes if n.node_type == "RoomType" and n.value == "kitchen")
     assert living_room_id != kitchen_id
@@ -146,11 +106,30 @@ async def test_multi_room_message_writes_each_rooms_facts_under_its_own_subtree(
 async def test_execute_dispatches_two_same_type_tasks_independently():
     calls: list[str] = []
 
-    async def fake_build_context_node(state, task=None):
+    async def fake_build_context_node(state, task=None, resolved=None):
         calls.append(task.target)
-        return {"update_summary": f"noted {task.target}", "active_room_id": task.room_hint, "trace": []}
+        return {
+            "update_summary": f"noted {task.target}",
+            "pending_gap": {
+                "canonical_path": f"Project.Rooms.{task.room_hint}.Style", "field_label": "style",
+                "node_type": "Style", "room_id": task.room_hint,
+            },
+            "trace": [],
+        }
 
-    with patch("app.graph.build_context_node", side_effect=fake_build_context_node):
+    async def fake_extract_empty(message, known, **kwargs):
+        return ExtractedFields()
+
+    # Distinct, unmatched room_hints (neither "room-living" nor "room-kitchen"
+    # is a real room name any existing room could fuzzy-match) so the two
+    # tasks resolve to two DIFFERENT new rooms and land in separate clusters
+    # — this is what proves they're still dispatched independently under the
+    # resolve+cluster+commit pipeline, not just "both eventually called".
+    with (
+        patch("app.graph.build_context_node", side_effect=fake_build_context_node),
+        patch("app.llm.extract_fields", side_effect=fake_extract_empty),
+        patch("app.llm.extract_graph_links", side_effect=fake_extract_graph_links),
+    ):
         result = await execute(
             [
                 TaskSpec(type=TaskType.EDIT_CONTEXT, target="living room facts", room_hint="room-living"),
@@ -159,9 +138,9 @@ async def test_execute_dispatches_two_same_type_tasks_independently():
             base_state("living room facts and kitchen facts"),
         )
 
-    assert calls == ["living room facts", "kitchen facts"], "both tasks must actually be dispatched, not just the first"
+    assert sorted(calls) == ["kitchen facts", "living room facts"], "both tasks must actually be dispatched, not just the first"
     assert "noted living room facts" in result["update_summary"]
     assert "noted kitchen facts" in result["update_summary"]
-    # "Active room" after a multi-room turn is whichever room the LAST task
-    # touched — see execution.py's own docstring on this design decision.
-    assert result["active_room_id"] == "room-kitchen"
+    # pending_gap merges "first non-null wins" (mirrors pending_confirmation)
+    # — the first task's own sub-result survives into the merged state.
+    assert result["pending_gap"]["room_id"] == "room-living"

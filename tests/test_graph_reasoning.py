@@ -1,7 +1,7 @@
+from app import graph_store
 from app.context_builder import ProposedWrite, apply_to_graph
 from app.dependency_graph import add_edge
 from app.graph_reasoning import items_depending_on, rooms_exceeding_budget, rooms_with_material
-from app.models import KnowledgeNode
 
 
 async def _room_line_item(project_id: str, room_id: str, item_slug: str, amount) -> None:
@@ -12,9 +12,9 @@ async def _room_line_item(project_id: str, room_id: str, item_slug: str, amount)
     directly, same as app.dependency_graph's own worked-example tests."""
     path = f"Project.Quotation.RoomLineItems.{item_slug}.Amount"
     await apply_to_graph(project_id, [ProposedWrite(canonical_path=path, node_type="Amount", value=amount, room_id=room_id, tier="optional")])
-    node = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == path)
+    node = await graph_store.find_one(project_id, path)
     node.room_id = room_id
-    await node.save()
+    await graph_store.save_node(node)
 
 
 async def test_rooms_exceeding_budget_finds_the_one_room_that_actually_exceeds():
@@ -101,8 +101,8 @@ async def test_items_depending_on_delegates_to_the_dependency_graph():
             ProposedWrite(canonical_path="Project.Quotation.RoomLineItems.cabinet.Amount", node_type="Amount", value=1200, room_id="k1", tier="optional"),
         ],
     )
-    material = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == "Project.Rooms.k1.Materials.cabinet.Material")
-    line_item = await KnowledgeNode.find_one(KnowledgeNode.project_id == project_id, KnowledgeNode.canonical_path == "Project.Quotation.RoomLineItems.cabinet.Amount")
+    material = await graph_store.find_one(project_id, "Project.Rooms.k1.Materials.cabinet.Material")
+    line_item = await graph_store.find_one(project_id, "Project.Quotation.RoomLineItems.cabinet.Amount")
     await add_edge(line_item.node_id, material.node_id, "derives_from", project_id)
 
     dependents = await items_depending_on(project_id, material.node_id)

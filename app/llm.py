@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Literal, Optional
@@ -8,13 +8,25 @@ from instructor.core.exceptions import InstructorRetryException
 from pydantic import BaseModel, Field
 
 from app import observability  # noqa: F401  (constructs the Langfuse singleton before AsyncOpenAI below)
+from app import prompts
 from app.config import settings
 from langfuse.openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-client = AsyncOpenAI(api_key=settings.deepinfra_api_key, base_url=settings.deepinfra_base_url)
+client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
 structured_client = instructor.from_openai(client, mode=instructor.Mode.TOOLS)
+
+# Fireworks-specific request params for gpt-oss-120b (every text role below
+# except vision/embed — see config.py, "reasoning model" caution). Passed via
+# extra_body since neither is a standard OpenAI chat-completions field the
+# openai SDK exposes as a named kwarg. "low" keeps hidden reasoning-token
+# generation down for latency, same posture as this module's existing
+# fast/low-stakes model choices; "disabled" turns off reasoning-history
+# prompt formatting — this module never reads or re-feeds reasoning/analysis
+# content back into context anywhere (every call site below only ever uses
+# `.content`), so there's nothing here that depended on it being on.
+_REASONING_KWARGS = {"reasoning_effort": "low", "reasoning_history": "disabled"}
 
 
 class MaterialSpec(BaseModel):
@@ -79,95 +91,260 @@ def _duplicate_json_keys(raw_json_text: str) -> list[str]:
         pass
     return duplicates
 
-Intent = Literal["context_related", "direct_question", "database_query", "update_context"]
-_VALID_INTENTS = {"context_related", "direct_question", "database_query", "update_context"}
 
-_CLASSIFY_SYSTEM = (
-    "You are an intent router for an interior design assistant. Classify the user's "
-    "latest message into exactly one label — or, rarely, two comma-separated labels "
-    "if the message clearly glues together two separate asks (see the last rule "
-    "below):\n"
-    "- context_related: asks about details already given in this conversation (e.g. "
-    "'what's my budget again?')\n"
-    "- direct_question: expects an answer — general questions, and ALSO cost/price/"
-    "budget/advice questions like 'what would the kitchen cost' or 'what should this "
-    "cost for a luxury house' — these want a real answer, not a follow-up question\n"
-    "- database_query: asks to find/search/recommend specific products or style "
-    "references\n"
-    "- update_context: STATES a new or updated project fact/preference (room, budget "
-    "number, style, size, furniture, a specific material, timeline) — the user is "
-    "telling you something, not asking something\n\n"
-    "The single most important rule: if the latest message is ITSELF phrased as a "
-    "question (contains 'what', 'how', 'when', 'why', 'should', 'can you', asks the "
-    "cost/price/budget of something, etc.), it is NEVER update_context — classify it "
-    "by what it's asking about instead. This holds regardless of what the assistant's "
-    "previous message asked; a question is always a question, even right after the "
-    "assistant asked the user something.\n\n"
-    "update_context is only for messages that state a fact, even a brief one with no "
-    "question mark — e.g. 'quartz countertops', 'I want oak flooring', '$15k budget', "
-    "'600 sqft', including short replies that directly answer a pending question with "
-    "an actual fact (not another question).\n\n"
-    "A greeting or small talk with no project fact in it (e.g. 'hello', 'hi', 'hey', "
-    "'thanks') is direct_question, never update_context — there is nothing to update.\n\n"
-    "Two-label rule: only output two labels when the message states a fact AND asks a "
-    "separate question in the same breath (e.g. 'what does oak flooring cost, and my "
-    "budget is $15k' -> database_query,update_context). A single short answer like "
-    "'residential' or 'modern' is always exactly one label (update_context), never two.\n\n"
-    "Examples:\n"
-    "\"what's my budget again?\" -> context_related\n"
-    "\"what should my budget be?\" -> direct_question\n"
-    "\"modern\" (pending: room style) -> update_context\n"
-    "\"recommend some tile options\" -> database_query\n"
-    "\"what would oak flooring cost?\" -> direct_question\n"
-    "\"quartz countertops\" -> update_context\n"
-    "\"hey\" -> direct_question\n"
-    "\"can I get a quote on that walnut console\" -> database_query\n"
-    "\"oak flooring for the kitchen, love the modern look\" -> update_context   "
-    "(NOT two labels — one continuous fact, no question)\n"
-    "\"modern, and keep it under $15k\" -> update_context   "
-    "(NOT two labels — both are facts, not a fact+question)\n"
-    "\"what does oak flooring cost, and my budget is $15k\" -> database_query,update_context   "
-    "(genuine compound: a question AND a separate fact)\n"
-    "\"recommend some tile options for my modern kitchen\" -> database_query   "
-    "(NOT two labels — the style mention is context for the search, not a separate fact to extract)\n\n"
-    "Reply with only the label(s), nothing else."
-)
+OperationIntent = Literal[
+    "CONTEXT_UPDATE", "CONTEXT_DELETE", "CONTEXT_RETRIEVAL", "DATABASE_RETRIEVAL", "DIRECT_ANSWER"
+]
 
 
-async def classify_intent(
+class Operation(BaseModel):
+    text: str = Field(description="the original meaningful operation text, preserving the user's wording")
+    intent: OperationIntent
+    # Grounds this operation to a spot in the project tree, per the
+    # project-state text classify_operations_user() feeds the model — a
+    # root-relative canonical path ("Rooms.a1b2c3d4.Materials.countertop"),
+    # a not-yet-existing entity name ("Living Room"), or None when the model
+    # can't confidently place it. app.graph's clarifying-question branch
+    # asks the user directly for every operation where this is None.
+    connection: Optional[str] = None
+    # Assigned by classify_operations() after parsing, by list order
+    # ("op_1", "op_2", ...) — never requested from the model itself, so a
+    # duplicate/missing id can never happen.
+    id: str = ""
+
+
+class OperationClassification(BaseModel):
+    operations: list[Operation] = Field(default_factory=list)
+
+
+# Replaces classify_intent (below) — one structured call that both splits the
+# message into independent operations AND labels each with one intent,
+# instead of a single label (rarely two, via comma-splitting) per whole
+# message plus separate regex guards/segmentation layered on top in
+# app/understanding.py. Prompt text (with its own rationale) lives in
+# app/prompts.py — CLASSIFY_OPERATIONS_SYSTEM.
+
+
+async def _salvage_operations(exc: InstructorRetryException, capture: dict | None = None) -> Optional[list[Operation]]:
+    """Same recovery strategy as _salvage_extracted_fields/_salvage_extracted_graph_links —
+    scans every failed attempt for a real tool call or a JSON object embedded in
+    plain text content, so a parse hiccup doesn't silently drop an entire
+    turn's worth of operations."""
+    for attempt in exc.failed_attempts or []:
+        completion = getattr(attempt, "completion", None)
+        if not completion or not completion.choices:
+            continue
+        message = completion.choices[0].message
+
+        raw: Optional[str] = None
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            raw = tool_calls[0].function.arguments
+        elif message.content:
+            content = message.content
+            start, end = content.find("{"), content.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                raw = content[start : end + 1]
+
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+            result = OperationClassification.model_validate(payload)
+        except (ValueError, TypeError):
+            continue
+        if capture is not None:
+            capture["raw_output"] = raw
+        return result.operations
+    return None
+
+
+async def classify_operations(
     message: str,
     history: str = "",
     pending_field: str | None = None,
     *,
+    tree_text: str = "Project",
     capture: dict | None = None,
-) -> list[Intent]:
+) -> list[Operation]:
+    """Wraps _classify_operations_retrying with op.id assignment — every
+    caller gets ids ("op_1", "op_2", ...) by list order, never requested from
+    the model itself (see Operation.id's docstring). `tree_text` grounds
+    each operation's `connection` against the project's current state (see
+    app.context_builder.render_project_tree_text) — defaults to a bare,
+    empty-project tree so existing callers that don't pass it (mostly tests)
+    keep working."""
+    operations = await _classify_operations_retrying(message, history, pending_field, tree_text, capture=capture)
+    for i, op in enumerate(operations, start=1):
+        op.id = f"op_{i}"
+    return operations
+
+
+async def _classify_operations_retrying(
+    message: str,
+    history: str,
+    pending_field: str | None,
+    tree_text: str,
+    *,
+    capture: dict | None = None,
+) -> list[Operation]:
+    last_exc: Optional[InstructorRetryException] = None
+    for max_retries in (0, 4):
+        try:
+            return await _classify_operations_raw(message, history, pending_field, tree_text, max_retries, capture=capture)
+        except InstructorRetryException as exc:
+            salvaged = await _salvage_operations(exc, capture=capture)
+            if salvaged is not None:
+                return salvaged
+            last_exc = exc
+    raise last_exc
+
+
+async def _classify_operations_raw(
+    message: str,
+    history: str,
+    pending_field: str | None,
+    tree_text: str,
+    max_retries: int,
+    capture: dict | None = None,
+) -> list[Operation]:
     messages = [
-        {"role": "system", "content": _CLASSIFY_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                f"Conversation so far:\n{history}\n\n"
-                f"Currently pending question (if any): {pending_field or 'none'}\n\n"
-                f"Latest message:\n{message}"
-            ),
-        },
+        {"role": "system", "content": prompts.classify_operations_system(tree_text)},
+        {"role": "user", "content": prompts.classify_operations_user(message, history, pending_field)},
     ]
-    resp = await client.chat.completions.create(
-        model=settings.model_intent_classifier,
-        messages=messages,
-        temperature=0,
-        max_tokens=20,
-    )
     if capture is not None:
         capture["messages"] = messages
-        capture["raw_output"] = resp.choices[0].message.content
-    raw = (resp.choices[0].message.content or "").strip().lower()
-    labels: list[Intent] = []
-    for piece in raw.split(","):
-        label = piece.strip()
-        if label in _VALID_INTENTS and label not in labels:
-            labels.append(label)  # type: ignore[arg-type]
-    return labels or ["direct_question"]
+    result, completion = await structured_client.chat.completions.create_with_completion(
+        model=settings.model_intent_classifier,
+        response_model=OperationClassification,
+        max_tokens=1024,
+        max_retries=max_retries,
+        messages=messages,
+        extra_body=_REASONING_KWARGS,
+    )
+    if capture is not None:
+        capture["raw_output"] = _raw_completion_text(completion)
+    return result.operations
+
+
+class RoomResolutionOption(BaseModel):
+    # None for an inferred (not-yet-existing) room — see
+    # app.prompts.ROOM_RESOLUTION_AGENT_SYSTEM_TEMPLATE rule 11. A real
+    # existing room always carries its exact room id (rule 10).
+    id: Optional[str] = None
+    label: str
+
+
+class RoomResolutionItem(BaseModel):
+    """One operation's result from resolve_room_connections() — see
+    app.prompts.ROOM_RESOLUTION_AGENT_SYSTEM_TEMPLATE. Always carries a
+    question and at least one option, even when the room is confidently
+    resolved (rule 15: a single option then stands in for "confirm this
+    one") — there is no "resolvable without asking" verdict in this prompt,
+    unlike the old generate_clarification_question/ClarificationQuestion it
+    replaces. That's what keeps app.graph.classify_intent_node's
+    always-block posture (see the classifier-connection-always-block memory)
+    a property of the prompt itself rather than something the caller has to
+    enforce by ignoring a confidence flag."""
+
+    text: str
+    intent: str
+    question: str
+    options: list[RoomResolutionOption] = Field(default_factory=list)
+
+
+class RoomResolutionBatch(BaseModel):
+    resolutions: list[RoomResolutionItem] = Field(default_factory=list)
+
+
+async def _salvage_room_resolutions(
+    exc: InstructorRetryException, capture: dict | None = None
+) -> Optional[list[RoomResolutionItem]]:
+    """Same recovery strategy as _salvage_operations — scans every failed
+    attempt for a real tool call or a JSON array embedded in plain text
+    content, so a parse hiccup doesn't silently drop the whole batch's worth
+    of room questions."""
+    for attempt in exc.failed_attempts or []:
+        completion = getattr(attempt, "completion", None)
+        if not completion or not completion.choices:
+            continue
+        message = completion.choices[0].message
+
+        raw: Optional[str] = None
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            raw = tool_calls[0].function.arguments
+        elif message.content:
+            content = message.content
+            start, end = content.find("["), content.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                raw = content[start : end + 1]
+
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+            items = payload["resolutions"] if isinstance(payload, dict) else payload
+            result = [RoomResolutionItem.model_validate(item) for item in items]
+        except (ValueError, TypeError, KeyError):
+            continue
+        if capture is not None:
+            capture["raw_output"] = raw
+        return result
+    return None
+
+
+async def resolve_room_connections(
+    tree_text: str,
+    operations: list[dict],
+    *,
+    capture: dict | None = None,
+) -> list[RoomResolutionItem]:
+    """Every write operation in this turn whose connection came back None
+    from classify_operations, resolved in ONE batched call — replaces the
+    old generate_clarification_question, which ran once per unresolved
+    operation via asyncio.gather. `operations` is
+    `[{"text", "intent", "connection": None}, ...]`, in the exact order
+    app.graph._generate_operation_questions wants results back in (the
+    prompt's own rule 1 preserves input order, and rule 15 guarantees one
+    result per input operation — no id round-trip needed, the caller matches
+    positionally)."""
+    last_exc: Optional[InstructorRetryException] = None
+    for max_retries in (0, 4):
+        try:
+            return await _resolve_room_connections_raw(tree_text, operations, max_retries, capture=capture)
+        except InstructorRetryException as exc:
+            salvaged = await _salvage_room_resolutions(exc, capture=capture)
+            if salvaged is not None:
+                return salvaged
+            last_exc = exc
+    raise last_exc
+
+
+async def _resolve_room_connections_raw(
+    tree_text: str,
+    operations: list[dict],
+    max_retries: int,
+    capture: dict | None = None,
+) -> list[RoomResolutionItem]:
+    operations_json = json.dumps(operations, indent=2)
+    messages = [
+        {"role": "system", "content": prompts.room_resolution_agent_system(tree_text, operations_json)},
+        {"role": "user", "content": prompts.room_resolution_agent_user()},
+    ]
+    if capture is not None:
+        capture["messages"] = messages
+    result, completion = await structured_client.chat.completions.create_with_completion(
+        model=settings.model_intent_classifier,
+        response_model=RoomResolutionBatch,
+        max_tokens=1024,
+        max_retries=max_retries,
+        messages=messages,
+        extra_body=_REASONING_KWARGS,
+    )
+    if capture is not None:
+        capture["raw_output"] = _raw_completion_text(completion)
+    return result.resolutions
 
 
 class AdditionalRoomBudget(BaseModel):
@@ -365,23 +542,8 @@ async def _extract_fields_raw(
     message: str, known: dict, max_retries: int, capture: dict | None = None
 ) -> ExtractedFields:
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "Extract interior design project fields from the user's message. Only "
-                "fill fields explicitly stated or clearly implied; leave others null. "
-                "Do not invent values — if the message states no new project info (e.g. "
-                "it's just a question), return every field null. A hedged or approximate "
-                "statement ('maybe around 4 lakh', 'roughly 300 sqft') still counts as "
-                "stated — extract it with the hedge wording kept intact rather than "
-                "leaving the field null; only leave a field null when the message truly "
-                "doesn't address it at all."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Known so far: {known or '(nothing yet)'}\n\nNew message: {message}",
-        },
+        {"role": "system", "content": prompts.EXTRACT_FIELDS_SYSTEM},
+        {"role": "user", "content": prompts.extract_fields_user(known, message)},
     ]
     if capture is not None:
         capture["messages"] = messages
@@ -404,6 +566,7 @@ async def _extract_fields_raw(
         # ~100% but 30-75s/call for the slower model previously here).
         max_retries=max_retries,
         messages=messages,
+        extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["raw_output"] = _raw_completion_text(completion)
@@ -431,7 +594,7 @@ class GraphEdgeCreate(BaseModel):
 
 class GraphNodeRevise(BaseModel):
     """A correction to a fact already captured by a CANDIDATE node — see the
-    'no "instead" phrasing required' worked example in _GRAPH_SYSTEM_PROMPT.
+    'no "instead" phrasing required' worked example in app.prompts.GRAPH_SYSTEM_PROMPT.
     app/graph.py marks the target node superseded, creates a fresh node with
     new_label, and adds the 'revises' edge automatically — the model never
     emits that edge itself."""
@@ -448,7 +611,7 @@ class GraphNodeRevise(BaseModel):
 class GraphExtraction(BaseModel):
     new_nodes: list[GraphNodeCreate] = Field(default_factory=list)
     new_edges: list[GraphEdgeCreate] = Field(default_factory=list)
-    # Corrections to existing CANDIDATE nodes (see _GRAPH_SYSTEM_PROMPT) —
+    # Corrections to existing CANDIDATE nodes (see app.prompts.GRAPH_SYSTEM_PROMPT) —
     # fires on ANY correction, not just explicit "X instead of Y" phrasing.
     revised_nodes: list[GraphNodeRevise] = Field(default_factory=list)
     # Facts the user withdrew with no replacement (e.g. "never mind the
@@ -552,116 +715,6 @@ def _salvage_extracted_graph_links(
     return None
 
 
-_GRAPH_SYSTEM_PROMPT = (
-    "You extend a knowledge graph of an interior design project. You are given "
-    "a fixed set of ANCHOR nodes — the project itself, and one per room or "
-    "budget the client has mentioned — that already exist and are stable. "
-    "Never invent an id for the project or a room/budget, and never create a "
-    "new node for one: always reference the exact anchor id you were given. "
-    "You are also shown CANDIDATE nodes: freeform facts already captured "
-    "(furniture, materials, preferences, constraints, rejected alternatives) "
-    "that scored as plausibly related to this new message, gathered by "
-    "search across the ENTIRE project history — not just recent turns, so a "
-    "candidate may be something said many messages ago if it's relevant to "
-    "correcting or extending now. It is NOT the complete history, so don't "
-    "assume something is new just because it isn't among the candidates "
-    "shown.\n\n"
-    "From the user's new message, extract new nodes (facts, preferences, "
-    "entities, constraints, or rejected alternatives actually stated or "
-    "clearly implied) and edges connecting each one to an anchor id or to a "
-    "candidate node id you were given. Do not invent facts not stated.\n\n"
-    "If the message instead CORRECTS or refines something a candidate node "
-    "already represents, use revise_node — this applies to ANY correction, "
-    "not only explicit 'X instead of Y' phrasing: 'let's make it navy', "
-    "'actually go with quartz', 'scratch the walnut, do oak', 'change the "
-    "budget to 5 lakh' are ALL revisions of an existing candidate if one "
-    "matches, not new unconnected facts. target_node_id MUST be copied "
-    "exactly from a candidate id you were shown — never invent one, and "
-    "never use revise_node against an anchor or a node not in the candidate "
-    "list. Prefer revise_node over creating both an "
-    "add_node-and-rejected_in_favor_of pair — reserve "
-    "rejected_in_favor_of for when the user explicitly wants BOTH the old "
-    "and new choice kept visible as a comparison (rare).\n\n"
-    "If the user drops something with no replacement ('never mind the "
-    "accent wall'), put that candidate's id in retracted_node_ids instead of "
-    "creating or revising anything.\n\n"
-    "Pick the relation deliberately: 'located_in' when an item belongs to a "
-    "room, 'uses_material' when a material is chosen for an item, "
-    "'budget_for' when a figure applies to a room or the project, "
-    "'applies_to' for a preference/requirement about a room, "
-    "'rejected_in_favor_of' when the user explicitly drops one choice for "
-    "another, 'requires' for a stated dependency, 'modifies' when one fact "
-    "refines another, 'part_of' for plain containment. Every relation reads "
-    "child-to-parent: source is the more specific thing, target is what it "
-    "belongs to or applies to — so a budget figure's edge always goes "
-    "'source: the budget node, target: the room or project it's for', never "
-    "the other way around (see the worked example below). Reuse an existing "
-    "id (anchor or recent) when the message refers to something already "
-    "captured — never duplicate a node for the same concept. Keep new node "
-    "ids short snake_case slugs. Preserve concrete numbers and named choices "
-    "in the label (e.g. '15 lakh budget', not just 'Budget').\n\n"
-    "If the message states a figure for the project overall AND a separate "
-    "figure for one specific room, extract BOTH as distinct nodes with "
-    "distinct labels and give each its own 'budget_for' edge to its own "
-    "target (project vs. that room's anchor) — never merge two different "
-    "figures into one node, and never attach a room's own figure to the "
-    "project anchor or vice versa.\n\n"
-    "A new node's type must be exactly one of: room, preference, constraint, "
-    "attribute, entity. Never 'project' or 'budget' — those only exist as "
-    "the anchors you were already given, never as something you create. If "
-    "the message states a budget figure for a room or the project that "
-    "doesn't have an anchor yet, create it as type 'attribute' (not "
-    "'budget') and connect it to the closest anchor you do have — the "
-    "project anchor if no room anchor exists yet — with relation "
-    "'budget_for'.\n\n"
-    "When the message says 'both' or 'both the X's', work out concretely, "
-    "from the message and the anchors shown, exactly which rooms that refers "
-    "to — do not attach the fact to every room anchor, only the ones meant.\n\n"
-    "Example:\n"
-    "Known anchors:\n- project (project): Project\n- room:8f3a1c2d (room): Kitchen\n\n"
-    "Recently mentioned items:\n(none recent)\n\n"
-    "Recent relations:\n(none recent)\n\n"
-    "New message: \"acrylic finish on the kitchen cabinets\"\n"
-    "-> new_nodes: [{id: kitchen_cabinet, label: 'Kitchen cabinet', type: entity}, "
-    "{id: kitchen_cabinet_acrylic, label: 'Acrylic finish', type: attribute}]\n"
-    "-> new_edges: [{source: kitchen_cabinet, target: 'room:8f3a1c2d', relation: "
-    "located_in}, {source: kitchen_cabinet, target: kitchen_cabinet_acrylic, "
-    "relation: uses_material}]\n\n"
-    "Example (rejected alternative):\n"
-    "New message: \"we're going with quartz instead of the marble countertop\"\n"
-    "-> new_nodes: [{id: countertop_quartz, label: 'Quartz countertop', type: "
-    "attribute}, {id: countertop_marble, label: 'Marble countertop (rejected)', "
-    "type: attribute}]\n"
-    "-> new_edges: [{source: countertop_marble, target: countertop_quartz, "
-    "relation: rejected_in_favor_of}]\n\n"
-    "Example (project total AND a separate room figure in one message):\n"
-    "Known anchors:\n- project (project): Project\n- room:8f3a1c2d (room): Kitchen\n\n"
-    "Recently mentioned items:\n(none recent)\n\n"
-    "Recent relations:\n(none recent)\n\n"
-    "New message: \"total budget is 15 lakh, and 4 lakh of that is for the kitchen\"\n"
-    "-> new_nodes: [{id: project_budget_total, label: '15 lakh total budget', "
-    "type: attribute}, {id: kitchen_budget, label: '4 lakh kitchen budget', "
-    "type: attribute}]\n"
-    "-> new_edges: [{source: project_budget_total, target: project, relation: "
-    "budget_for}, {source: kitchen_budget, target: 'room:8f3a1c2d', relation: "
-    "budget_for}]\n"
-    "(TWO separate nodes, each with its own edge to its own target — never "
-    "one node claimed by both, and the budget node is always the edge's "
-    "source, the thing it applies to is always the target.)\n\n"
-    "Example (correction WITHOUT 'instead' phrasing — match this pattern, "
-    "not just explicit contrast phrasing):\n"
-    "Candidates:\n- attr_a1b2c3d4 (attribute): Acrylic finish\n\n"
-    "New message: \"actually let's do a matte lacquer on those cabinets\"\n"
-    "-> revised_nodes: [{target_node_id: attr_a1b2c3d4, new_label: 'Matte "
-    "lacquer finish'}]\n"
-    "-> new_nodes: [], new_edges: []\n\n"
-    "Example (retraction):\n"
-    "Candidates:\n- attr_accent_wall (attribute): Navy accent wall\n\n"
-    "New message: \"never mind the accent wall\"\n"
-    "-> retracted_node_ids: [attr_accent_wall]"
-)
-
-
 async def extract_graph_links(
     message: str,
     anchors: list[dict],
@@ -708,23 +761,9 @@ async def _extract_graph_links_raw(
     max_retries: int,
     capture: dict | None = None,
 ) -> GraphExtraction:
-    anchors_summary = "\n".join(f"- {a['id']} ({a['type']}): {a['label']}" for a in anchors) or "(none yet)"
-    nodes_summary = "\n".join(f"- {n['id']} ({n['type']}): {n['label']}" for n in recent_nodes) or "(none recent)"
-    edges_summary = (
-        "\n".join(f"- {e['source']} -[{e['relation']}]-> {e['target']}" for e in recent_edges) or "(none recent)"
-    )
     messages = [
-        {"role": "system", "content": _GRAPH_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Known anchors (the project and its rooms/budgets — always exist, "
-                f"reference by id):\n{anchors_summary}\n\n"
-                f"Recently mentioned items:\n{nodes_summary}\n\n"
-                f"Recent relations:\n{edges_summary}\n\n"
-                f"New message: {message}"
-            ),
-        },
+        {"role": "system", "content": prompts.GRAPH_SYSTEM_PROMPT},
+        {"role": "user", "content": prompts.graph_links_user(anchors, recent_nodes, recent_edges, message)},
     ]
     if capture is not None:
         capture["messages"] = messages
@@ -734,63 +773,25 @@ async def _extract_graph_links_raw(
         max_tokens=1024,
         max_retries=max_retries,
         messages=messages,
+        extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["raw_output"] = _raw_completion_text(completion)
     return result
 
 
-_QUESTION_PERSONA = (
-    "You are a senior interior designer, briefing a junior designer who is "
-    "gathering client details for a project quotation. Ask the way one designer "
-    "asks a colleague in a normal working conversation — natural, warm, plain "
-    "language — never like a form field or questionnaire prompt.\n\n"
-    "Stay neutral: ask the question and nothing more. Do not volunteer your own "
-    "opinion, a recommendation, or a suggested budget/material figure unless the "
-    "question itself is explicitly asking the junior designer whether they'd "
-    "like a suggestion. Do not comment on, second-guess, or react to anything "
-    "already given — just move the intake forward."
-)
-
-
 async def generate_question(
-    field_name: str,
+    field_names: list[str],
     context: dict,
     *,
     is_retry: bool = False,
     capture: dict | None = None,
 ) -> str:
-    if field_name == "materials":
-        task = (
-            "Ask ONE general, open-ended question about material preferences for "
-            "the room, tailored to the roomType already known (e.g. for a kitchen "
-            "you might mention countertops, cabinets, flooring as examples; for a "
-            "living room, flooring or furniture). Give examples loosely, don't "
-            "demand a checklist or ask about each surface separately — just invite "
-            "whatever materials come to mind."
-        )
-    else:
-        task = f"Ask one concise, natural question that gathers the '{field_name}' field."
-
-    if is_retry:
-        framing = (
-            "The junior designer didn't have an answer last time this was asked. "
-            "Ask again, gently — keep it close to how it was likely asked before, "
-            "don't add a new example or a different framing, and make clear it's "
-            "fine if they still don't have that detail."
-        )
-    else:
-        framing = ""
-
+    """field_names is one or more field labels to gather in a single combined
+    question — see app.prompts.question_system."""
     messages = [
-        {
-            "role": "system",
-            "content": f"{_QUESTION_PERSONA}\n\n{task}" + (f"\n\n{framing}" if framing else ""),
-        },
-        {
-            "role": "user",
-            "content": f"Known so far: {context}",
-        },
+        {"role": "system", "content": prompts.question_system(field_names, is_retry)},
+        {"role": "user", "content": prompts.question_user(context)},
     ]
     resp = await client.chat.completions.create(
         model=settings.model_question_gen,
@@ -801,23 +802,12 @@ async def generate_question(
         # emitting the final answer; too low a budget truncates before any
         # visible content is produced (finish_reason="length", content="").
         max_tokens=1024,
+        extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["messages"] = messages
         capture["raw_output"] = resp.choices[0].message.content
     return resp.choices[0].message.content or ""
-
-
-_WRAPUP_PERSONA = (
-    "You are a senior interior designer, briefing a junior designer who just "
-    "finished gathering client details for a project quotation. Everything "
-    "needed has been captured (any leftover details were filled in with "
-    "reasonable assumptions, not asked about again). Write ONE short, warm "
-    "closing line for the junior designer to say to the client — a plain "
-    "declarative statement, NOT a question, and don't propose or hint at "
-    "asking anything further. Natural, professional, no exclamation-mark "
-    "enthusiasm."
-)
 
 
 async def generate_wrapup_message(context: dict, *, capture: dict | None = None) -> str:
@@ -832,28 +822,20 @@ async def generate_wrapup_message(context: dict, *, capture: dict | None = None)
     model matters for the same latency reasons documented on model_question_gen
     in config.py."""
     messages = [
-        {"role": "system", "content": _WRAPUP_PERSONA},
-        {"role": "user", "content": f"Project details gathered: {context}"},
+        {"role": "system", "content": prompts.WRAPUP_PERSONA},
+        {"role": "user", "content": prompts.wrapup_user(context)},
     ]
     resp = await client.chat.completions.create(
         model=settings.model_question_gen,
         messages=messages,
         temperature=0.7,
         max_tokens=256,
+        extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["messages"] = messages
         capture["raw_output"] = resp.choices[0].message.content
     return resp.choices[0].message.content or ""
-
-
-_MERGE_PERSONA = (
-    "You are a senior interior designer, briefing a junior designer, composing ONE short reply "
-    "that covers everything from this turn (a fact just noted, a question just answered, or "
-    "both) as a single natural message — never a list, never labeled sections, never repeating "
-    "a piece verbatim. If multiple things happened this turn, blend them the way a person "
-    "actually talks, not a bulleted summary."
-)
 
 
 async def merge_response(parts: list[str], *, capture: dict | None = None) -> str:
@@ -863,14 +845,15 @@ async def merge_response(parts: list[str], *, capture: dict | None = None) -> st
     generate_wrapup_message — this is short, low-stakes composition, not a
     real answer needing the slower model."""
     messages = [
-        {"role": "system", "content": _MERGE_PERSONA},
-        {"role": "user", "content": "Pieces to blend into one reply:\n" + "\n---\n".join(parts)},
+        {"role": "system", "content": prompts.MERGE_PERSONA},
+        {"role": "user", "content": prompts.merge_user(parts)},
     ]
     resp = await client.chat.completions.create(
         model=settings.model_question_gen,
         messages=messages,
         temperature=0.7,
         max_tokens=256,
+        extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["messages"] = messages
@@ -878,101 +861,29 @@ async def merge_response(parts: list[str], *, capture: dict | None = None) -> st
     return resp.choices[0].message.content or ""
 
 
-_CONFIRM_CHANGE_PERSONA = (
-    "You are a senior interior designer, briefing a junior designer, about to change a client "
-    "detail that was already recorded. Ask ONE short, natural confirmation question — mention "
-    "the old value and the new one plainly (not a form-style diff), and ask whether the change "
-    "is really what the client meant. Neutral tone, no assumption either way."
-)
 
 
-async def generate_conflict_confirmation(
-    field_label: str, old_value, new_value, *, capture: dict | None = None
-) -> str:
-    """Used by app.graph.build_context_node when a critical-tier field's
-    value would change (app.context_builder.detect_conflicts) — same call
-    shape as generate_wrapup_message/merge_response (fast model_question_gen,
-    short/low-stakes), not a real answer needing the slower model."""
-    messages = [
-        {"role": "system", "content": _CONFIRM_CHANGE_PERSONA},
-        {"role": "user", "content": f"Field: {field_label}\nPreviously recorded: {old_value}\nJust stated: {new_value}"},
-    ]
-    resp = await client.chat.completions.create(
-        model=settings.model_question_gen,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=256,
-    )
-    if capture is not None:
-        capture["messages"] = messages
-        capture["raw_output"] = resp.choices[0].message.content
-    return resp.choices[0].message.content or ""
-
-
-_CONFIRM_DELETE_PERSONA = (
-    "You are a senior interior designer, briefing a junior designer, about to remove a client "
-    "detail that was already recorded. Ask ONE short, natural confirmation question — name the "
-    "thing being removed plainly, and ask whether the client really wants it taken out. Neutral "
-    "tone, no assumption either way — this is a removal, not a value change, so never phrase it "
-    "as 'change X from A to B'."
-)
-
-
-async def generate_conflict_confirmation_delete(old_value, *, capture: dict | None = None) -> str:
-    """Delete's counterpart to generate_conflict_confirmation above — a
-    separate function rather than an optional-everything signature on that
-    one, since "remove X?" and "change X from A to B?" are different enough
-    prompts to want their own persona text. Used by
-    app.graph.delete_context_node for a critical-tier removal; same
-    fast/low-stakes model_question_gen call shape as every other confirmation/
-    question-gen call in this module."""
-    messages = [
-        {"role": "system", "content": _CONFIRM_DELETE_PERSONA},
-        {"role": "user", "content": f"Currently recorded: {old_value}\nClient asked to remove this."},
-    ]
-    resp = await client.chat.completions.create(
-        model=settings.model_question_gen,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=256,
-    )
-    if capture is not None:
-        capture["messages"] = messages
-        capture["raw_output"] = resp.choices[0].message.content
-    return resp.choices[0].message.content or ""
 
 
 async def infer_missing_field(field_name: str, context: dict, *, capture: dict | None = None) -> str:
-    """Terminal fallback for a field the client's retry budget ran out on
-    before they answered (see app.graph.decline_field_node, which calls this
-    via app.inference.infer_field the moment a field's attempts are
-    exhausted) — produces a single reasonable value grounded in whatever's
-    already known (room type, style, budget, typical ranges), so the project
-    can complete instead of blocking indefinitely. The caller stores this
-    with changed_by="inferred", not "user_message"."""
+    """Called via app.inference.infer_field — produces a single reasonable
+    value grounded in whatever's already known (room type, style, budget,
+    typical ranges), so a field can be filled without a user answer. Not
+    wired into the live decline path today (that's now a whole-room skip,
+    see app.graph.classify_intent_node) — infer_field/infer_missing_field
+    stay independently available and tested (tests/test_fact_inference_calculation.py)
+    for other callers. The caller stores this with changed_by="inferred",
+    not "user_message"."""
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a senior interior designer filling in a single missing "
-                "quotation detail with your best professional estimate, because the "
-                "client's answer wasn't available. Given the project details already "
-                "known, output ONLY a short, concrete value for the requested field — "
-                "a typical/reasonable figure or description, grounded in the known "
-                "context (not a generic placeholder). No explanation, no caveats, just "
-                "the value itself (e.g. '150 sqft', '$8k-$12k', 'modern')."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Known project details: {context}\n\nField to estimate: {field_name}",
-        },
+        {"role": "system", "content": prompts.INFER_MISSING_FIELD_SYSTEM},
+        {"role": "user", "content": prompts.infer_missing_field_user(context, field_name)},
     ]
     resp = await client.chat.completions.create(
         model=settings.model_extraction,
         messages=messages,
         temperature=0.3,
         max_tokens=64,
+        extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["messages"] = messages
@@ -984,24 +895,8 @@ async def generate_answer(
     message: str, context: dict, history: str = "", retrieved: str = "", *, capture: dict | None = None
 ) -> AsyncIterator[str]:
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a senior interior designer answering a colleague's question "
-                "in the middle of a client intake. Use the project context and any "
-                "retrieved reference material to answer helpfully and concisely, in a "
-                "natural, professional voice — not a form or a lecture."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Project context: {context}\n\n"
-                f"Retrieved references: {retrieved or 'none'}\n\n"
-                f"Conversation so far:\n{history}\n\n"
-                f"User: {message}"
-            ),
-        },
+        {"role": "system", "content": prompts.GENERATE_ANSWER_SYSTEM},
+        {"role": "user", "content": prompts.generate_answer_user(context, retrieved, history, message)},
     ]
     if capture is not None:
         capture["messages"] = messages
@@ -1009,6 +904,7 @@ async def generate_answer(
         model=settings.model_answer,
         messages=messages,
         stream=True,
+        extra_body=_REASONING_KWARGS,
     )
     async for chunk in stream:
         delta = chunk.choices[0].delta.content if chunk.choices else None

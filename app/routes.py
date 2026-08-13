@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
-from app.models import ChatSession, KnowledgeNode, ProjectContext
+from app import graph_store
+from app.models import ChatSession, ProjectContext
 
 router = APIRouter()
 
@@ -29,15 +30,15 @@ async def get_session_state(session_id: str):
     session = await ChatSession.find_one(ChatSession.session_id == session_id)
     if not session:
         raise HTTPException(status_code=404, detail="session not found")
-    nodes = await KnowledgeNode.find(KnowledgeNode.project_id == session.project_id).to_list()
+    nodes = await graph_store.find_nodes(session.project_id)
     return {
         "session_id": session.session_id,
         "project_id": session.project_id,
         "status": session.status,
-        "active_room_id": session.active_room_id,
-        "field_attempts": session.field_attempts,
+        "skipped_rooms": session.skipped_rooms,
+        "current_field": session.current_field,
         "pending_gap": session.pending_gap,
-        "pending_confirmation": session.pending_confirmation,
+        "pending_operation_questions": session.pending_operation_questions,
         "knowledge_nodes": [n.model_dump() for n in nodes],
         "trace": [t.model_dump() for t in session.trace],
         "messages": [m.model_dump() for m in session.messages],

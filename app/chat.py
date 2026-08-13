@@ -20,6 +20,10 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
     image_url: Optional[str] = None
+    # {op_id: chosen_value} answering a prior turn's operation_questions
+    # event (see app.graph.classify_intent_node's resume branch) — the only
+    # structured (non-message-text) reply channel this endpoint has.
+    operation_answers: Optional[dict[str, str]] = None
 
 
 # Some branches (e.g. update_context: extract_fields -> update_context_graph ->
@@ -38,7 +42,10 @@ def _sse(event_type: str, payload: dict) -> str:
 
 
 async def run_chat_turn(
-    session_id: Optional[str], message: str, image_url: Optional[str] = None
+    session_id: Optional[str],
+    message: str,
+    image_url: Optional[str] = None,
+    operation_answers: Optional[dict[str, str]] = None,
 ) -> AsyncIterator[dict]:
     """Runs one full chat turn end-to-end and yields transport-agnostic event
     dicts, formatted onto the wire as SSE by the /chat endpoint below.
@@ -48,14 +55,30 @@ async def run_chat_turn(
       {"type": "token", "content": str}
       {"type": "progress", "node": str}
       {"type": "trace", "node": str, "entries": list[dict]}  # TraceEntry.model_dump() per entry
+      {"type": "operation_progress", "task_type": str, "target": str, "ok": bool}
       {"type": "context_updated", "message": str}
       {"type": "confirm_change", "field": str, "old_value": Any, "new_value": Any, "question": str}
       {"type": "ask_question", "question": str}
+      {"type": "operation_questions", "questions": list[dict]}
+      # [{"op_id", "text", "question", "options": [{"id", "label"}, ...], "allow_custom": true}, ...]
+      # The viewer must render both the option list AND a free-text input for
+      # each question — `allow_custom` is always true (the reply channel
+      # below accepts any string per op_id, an option's own label or
+      # something the user typed).
       {"type": "wrapup", "message": str}
       {"type": "error", "message": str}
       {"type": "done", "session_id": str, "status": str}
       {"type": "heartbeat"}
-    """
+
+    `operation_progress` only fires during a multi-operation turn (see
+    app.execution.execute()) — one event per task as it finishes committing/
+    dispatching, finer-grained than the per-graph-node `progress` event above
+    (which only fires once for the whole `handle_split_intents` batch).
+
+    `operation_questions` fires when classify_intent_node couldn't ground
+    one or more write operations to a graph location (see the
+    classifier-connection plan) — reply on the NEXT call with
+    `operation_answers={op_id: chosen_value}` for each op_id listed."""
     session = await get_or_create_session(session_id)
     history = "\n".join(f"{m.role}: {m.content}" for m in session.messages[-10:])
     graph_message = message
@@ -80,14 +103,16 @@ async def run_chat_turn(
             "project_id": session.project_id,
             "message": graph_message,
             "history": history,
+            "skipped_rooms": list(session.skipped_rooms),
+            "current_field": session.current_field,
             "active_room_id": session.active_room_id,
-            "field_attempts": dict(session.field_attempts),
             "intent": [],
             "tasks": [],
             "retrieved": "",
             "pending_question": None,
             "pending_gap": session.pending_gap,
-            "pending_confirmation": session.pending_confirmation,
+            "pending_operation_questions": session.pending_operation_questions,
+            "operation_answers": operation_answers,
             "update_summary": None,
             "answer": "",
             "complete": False,
@@ -134,7 +159,21 @@ async def run_chat_turn(
                 if mode is _SENTINEL:
                     break
                 if mode == "custom":
-                    yield {"type": "token", "content": chunk["token"]}
+                    # Two distinct custom-stream producers share this mode:
+                    # generate_answer_node's token-by-token streaming
+                    # (chunk["type"] == "answer_token") and
+                    # execution.execute()'s per-task progress events
+                    # (chunk["type"] == "operation_progress") — see
+                    # app/execution.py's _progress_event.
+                    if chunk.get("type") == "answer_token":
+                        yield {"type": "token", "content": chunk["token"]}
+                    elif chunk.get("type") == "operation_progress":
+                        yield {
+                            "type": "operation_progress",
+                            "task_type": chunk["task_type"],
+                            "target": chunk["target"],
+                            "ok": chunk["ok"],
+                        }
                 elif mode == "updates":
                     for node_name, update in chunk.items():
                         yield {"type": "progress", "node": node_name}
@@ -165,8 +204,9 @@ async def run_chat_turn(
         if final_state["answer"]:
             session.messages.append(Message(role="assistant", content=final_state["answer"]))
 
+        session.skipped_rooms = final_state.get("skipped_rooms", session.skipped_rooms)
+        session.current_field = final_state.get("current_field", session.current_field)
         session.active_room_id = final_state.get("active_room_id", session.active_room_id)
-        session.field_attempts = final_state.get("field_attempts", session.field_attempts)
         session.trace.extend(final_state["trace"])
         # validate_completeness_node's verdict, computed earlier in this same
         # turn — equivalent to recomputing find_knowledge_gap() now (no node
@@ -183,37 +223,37 @@ async def run_chat_turn(
 
         # The "type 2" closing statement (see generate_wrapup_message) — set
         # exactly when complete_project_node ran this turn, mutually
-        # exclusive with pending_confirmation/pending_question below.
+
         wrapup_message = final_state.get("wrapup_message")
         if wrapup_message:
             session.messages.append(Message(role="assistant", content=wrapup_message))
             yield {"type": "wrapup", "message": wrapup_message}
 
-        # A critical-tier value change held back by build_context_node — see
-        # app.graph.confirm_conflict_node. Mutually exclusive with
-        # pending_question (build_context_node never sets both the same
-        # turn — see its docstring).
-        pending_confirmation = final_state.get("pending_confirmation")
+        # A critical-tier value change held back by build_context_node, an
+        # unresolved-connection batch held back by classify_intent_node, or
+        # an ordinary knowledge-gap question — mutually exclusive by
+        # construction (only one node ever produces this turn's trailing
+        # ask, see question_generated), checked in this order only because
+        # the if/elif chain needs SOME order.
+   
+        pending_operation_questions = final_state.get("pending_operation_questions")
         pending_question = final_state.get("pending_question")
-        if pending_confirmation and session.status == "in_progress":
-            session.messages.append(Message(role="assistant", content=pending_confirmation["question"]))
-            session.pending_confirmation = pending_confirmation
+
+   
+        if pending_operation_questions and session.status == "in_progress":
+            for q in pending_operation_questions["questions"]:
+                session.messages.append(Message(role="assistant", content=q["question"]))
+            session.pending_operation_questions = pending_operation_questions
             session.pending_gap = None
-            yield {
-                "type": "confirm_change",
-                "field": pending_confirmation["field_label"],
-                "old_value": pending_confirmation["old_value"],
-                "new_value": pending_confirmation["new_value"],
-                "question": pending_confirmation["question"],
-            }
-        elif pending_question and session.status == "in_progress":
+            yield {"type": "operation_questions", "questions": pending_operation_questions["questions"]}
+        if pending_question and session.status == "in_progress":
             session.messages.append(Message(role="assistant", content=pending_question))
             session.pending_gap = final_state.get("pending_gap")
-            session.pending_confirmation = None
+            session.pending_operation_questions = None
             yield {"type": "ask_question", "question": pending_question}
         else:
             session.pending_gap = None
-            session.pending_confirmation = None
+            session.pending_operation_questions = None
 
         await save_session(session)
 
@@ -224,7 +264,7 @@ async def run_chat_turn(
 @router.post("/chat")
 async def chat(req: ChatRequest):
     async def event_stream():
-        async for event in run_chat_turn(req.session_id, req.message, req.image_url):
+        async for event in run_chat_turn(req.session_id, req.message, req.image_url, req.operation_answers):
             if event["type"] == "heartbeat":
                 yield ": keep-alive\n\n"
                 continue

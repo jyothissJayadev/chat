@@ -1,5 +1,5 @@
+from app import graph_store
 from app.context_builder import ProposedWrite, apply_to_graph
-from app.models import KnowledgeNode
 from app.retrieval import load_subtree, resolve_query_to_path, retrieve_scoped
 
 
@@ -74,7 +74,7 @@ async def test_retrieve_scoped_sends_meaningfully_fewer_tokens_than_the_whole_pr
     project_id = "proj-retrieval-tokens"
     await _seed_multi_room_project(project_id)
 
-    whole_project = await KnowledgeNode.find(KnowledgeNode.project_id == project_id).to_list()
+    whole_project = await graph_store.find_nodes(project_id)
     scoped = await retrieve_scoped("what's the kitchen budget", project_id)
 
     whole_chars = sum(len(str(n.value)) + len(n.canonical_path) for n in whole_project)
