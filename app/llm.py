@@ -29,6 +29,23 @@ structured_client = instructor.from_openai(client, mode=instructor.Mode.TOOLS)
 _REASONING_KWARGS = {"reasoning_effort": "low", "reasoning_history": "disabled"}
 
 
+def _raw_completion_text(completion) -> str:
+    """Best-effort raw text of a chat completion — the tool-call arguments
+    JSON when the model made a real tool call (TOOLS mode structured output),
+    else plain message content. Shared by every structured-output call site
+    in this module (classify_operations, resolve_operations,
+    resolve_context_changes, ...) for its
+    `capture["raw_output"]` trace value."""
+    try:
+        message = completion.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        return tool_calls[0].function.arguments
+    return message.content or ""
+
+
 class MaterialSpec(BaseModel):
     """Material choice for one specific item/surface, e.g. flooring, countertop,
     sofa — extract_fields' structured-output shape for one ExtractedFields.materials
@@ -42,62 +59,17 @@ class MaterialSpec(BaseModel):
     specification: Optional[str] = None
 
 
-# extract_graph_links' structured-output relation vocabulary. Used to live in
-# app/models.py as ContextGraph's storage-level relation type; now purely an
-# extraction-schema constraint — app/context_builder.py doesn't persist these
-# as KnowledgeEdge rows yet (see its module docstring), it just surfaces them
-# in BuildResult.freeform_relationships. Deliberately still includes
-# part_of/located_in (containment relations the LLM's prompt below still
-# describes) even though KnowledgeEdgeRelation (app/models.py, Phase 9) drops
-# both as superseded by canonical_path — this is what the MODEL is allowed to
-# say, not what gets stored.
-GraphRelation = Literal[
-    "part_of",
-    "located_in",
-    "uses_material",
-    "applies_to",
-    "modifies",
-    "requires",
-    "budget_for",
-    "rejected_in_favor_of",
-    "revises",
-]
-
-
-def _duplicate_json_keys(raw_json_text: str) -> list[str]:
-    """Standard JSON parsing silently keeps only the LAST value for a
-    repeated key — live-observed on this model: given a message stating both
-    a project-wide total and a room-specific budget, it sometimes emits
-    'budgetOrRequirement' twice (once per figure) instead of routing the
-    total to overallBudget, and the first figure vanishes with no error, no
-    exception, nothing to salvage against. This can't be fixed after the
-    fact (which of two values was 'right' isn't recoverable once one is
-    already gone) — the caller logs the collision so it's visible instead of
-    silent; see ExtractedFields.overallBudget/budgetOrRequirement's
-    descriptions for the actual prompt-level fix."""
-    duplicates: list[str] = []
-
-    def hook(pairs):
-        seen = set()
-        for key, _ in pairs:
-            if key in seen:
-                duplicates.append(key)
-            seen.add(key)
-        return dict(pairs)
-
-    try:
-        json.loads(raw_json_text, object_pairs_hook=hook)
-    except ValueError:
-        pass
-    return duplicates
-
-
 OperationIntent = Literal[
     "CONTEXT_UPDATE", "CONTEXT_DELETE", "CONTEXT_RETRIEVAL", "DATABASE_RETRIEVAL", "DIRECT_ANSWER"
 ]
 
 
 class Operation(BaseModel):
+    # One short sentence from the model justifying its connection/confusion
+    # calls for this operation (app.prompts.CLASSIFY_OPERATIONS_SYSTEM_TEMPLATE's
+    # output.reasoning) — stripped before use downstream, kept only for
+    # trace/debugging.
+    reasoning: str = ""
     text: str = Field(description="the original meaningful operation text, preserving the user's wording")
     intent: OperationIntent
     # Grounds this operation to a spot in the project tree, per the
@@ -107,6 +79,16 @@ class Operation(BaseModel):
     # can't confidently place it. app.graph's clarifying-question branch
     # asks the user directly for every operation where this is None.
     connection: Optional[str] = None
+    # True when the user stated a genuine unresolved either/or CONTENT
+    # decision (see CLASSIFY_OPERATIONS_SYSTEM_TEMPLATE's CONFUSION section)
+    # — independent of `connection`: an operation can be ungrounded,
+    # content-undecided, both, or neither. app.graph's clarifying-question
+    # branch holds the turn for this too, alongside connection is None.
+    confusion: bool = False
+    # Short description of the specific fork, required (non-null) when
+    # confusion is True — feeds the Resolution Agent's content-question
+    # generation. Always None when confusion is False.
+    confusion_note: Optional[str] = None
     # Assigned by classify_operations() after parsing, by list order
     # ("op_1", "op_2", ...) — never requested from the model itself, so a
     # duplicate/missing id can never happen.
@@ -217,7 +199,16 @@ async def _classify_operations_raw(
     result, completion = await structured_client.chat.completions.create_with_completion(
         model=settings.model_intent_classifier,
         response_model=OperationClassification,
-        max_tokens=1024,
+        # gpt-oss-120b is a reasoning model — its hidden reasoning tokens
+        # (see _REASONING_KWARGS) are drawn from this same max_tokens budget
+        # before any visible output is produced. 1024 was enough for a
+        # short, single-operation message but silently truncated (provider
+        # "length" finish reason -> failed JSON validation -> instructor
+        # retry exhaustion) once a longer message splits into many
+        # operations, each with its own reasoning/text/intent/connection
+        # fields. Sized generously since gpt-oss-120b's context window has
+        # ample headroom for this.
+        max_tokens=4096,
         max_retries=max_retries,
         messages=messages,
         extra_body=_REASONING_KWARGS,
@@ -227,43 +218,55 @@ async def _classify_operations_raw(
     return result.operations
 
 
-class RoomResolutionOption(BaseModel):
-    # None for an inferred (not-yet-existing) room — see
-    # app.prompts.ROOM_RESOLUTION_AGENT_SYSTEM_TEMPLATE rule 11. A real
-    # existing room always carries its exact room id (rule 10).
+class Option(BaseModel):
+    # None for an inferred (not-yet-existing) room, or for any "content"
+    # resolution option (see app.prompts.RESOLUTION_AGENT_SYSTEM_TEMPLATE) —
+    # a real existing room always carries its exact room id. Left None on a
+    # bundled multi-room option too (room_ids set instead, see below).
     id: Optional[str] = None
     label: str
+    # Set ONLY on a bundled "room" option that applies the same operation to
+    # SEVERAL existing rooms at once (app.prompts.RESOLUTION_AGENT_SYSTEM_
+    # TEMPLATE's multi-room rule) — the exact room ids of every bundled
+    # room, copied verbatim from the tree, never an inferred/new room. None
+    # for an ordinary single-room option, and always None on a "content"
+    # option. app.graph.classify_intent_node's resume branch fans a chosen
+    # bundle out into one write task per room id.
+    room_ids: Optional[list[str]] = None
 
 
-class RoomResolutionItem(BaseModel):
-    """One operation's result from resolve_room_connections() — see
-    app.prompts.ROOM_RESOLUTION_AGENT_SYSTEM_TEMPLATE. Always carries a
-    question and at least one option, even when the room is confidently
-    resolved (rule 15: a single option then stands in for "confirm this
-    one") — there is no "resolvable without asking" verdict in this prompt,
-    unlike the old generate_clarification_question/ClarificationQuestion it
-    replaces. That's what keeps app.graph.classify_intent_node's
+class ResolutionItem(BaseModel):
+    """One open question for one operation, from resolve_operations() — see
+    app.prompts.RESOLUTION_AGENT_SYSTEM_TEMPLATE. `id` mirrors the input
+    operation's own id and is how the caller correlates results back — NOT
+    positional matching, since an operation needing both a room and a
+    content question returns TWO items sharing the same `id`. Always carries
+    a question and at least one option, even when a room is confidently
+    resolved ("confirm this one") — there is no "resolvable without asking"
+    verdict in this prompt, which is what keeps app.graph.classify_intent_node's
     always-block posture (see the classifier-connection-always-block memory)
     a property of the prompt itself rather than something the caller has to
     enforce by ignoring a confidence flag."""
 
+    id: str
+    resolution_type: Literal["room", "content"]
     text: str
     intent: str
     question: str
-    options: list[RoomResolutionOption] = Field(default_factory=list)
+    options: list[Option] = Field(default_factory=list)
 
 
-class RoomResolutionBatch(BaseModel):
-    resolutions: list[RoomResolutionItem] = Field(default_factory=list)
+class ResolutionBatch(BaseModel):
+    resolutions: list[ResolutionItem] = Field(default_factory=list)
 
 
-async def _salvage_room_resolutions(
+async def _salvage_resolutions(
     exc: InstructorRetryException, capture: dict | None = None
-) -> Optional[list[RoomResolutionItem]]:
+) -> Optional[list[ResolutionItem]]:
     """Same recovery strategy as _salvage_operations — scans every failed
     attempt for a real tool call or a JSON array embedded in plain text
     content, so a parse hiccup doesn't silently drop the whole batch's worth
-    of room questions."""
+    of questions."""
     for attempt in exc.failed_attempts or []:
         completion = getattr(attempt, "completion", None)
         if not completion or not completion.choices:
@@ -285,7 +288,7 @@ async def _salvage_room_resolutions(
         try:
             payload = json.loads(raw)
             items = payload["resolutions"] if isinstance(payload, dict) else payload
-            result = [RoomResolutionItem.model_validate(item) for item in items]
+            result = [ResolutionItem.model_validate(item) for item in items]
         except (ValueError, TypeError, KeyError):
             continue
         if capture is not None:
@@ -294,50 +297,53 @@ async def _salvage_room_resolutions(
     return None
 
 
-async def resolve_room_connections(
+async def resolve_operations(
     tree_text: str,
     operations: list[dict],
     *,
     capture: dict | None = None,
-) -> list[RoomResolutionItem]:
-    """Every write operation in this turn whose connection came back None
-    from classify_operations, resolved in ONE batched call — replaces the
-    old generate_clarification_question, which ran once per unresolved
-    operation via asyncio.gather. `operations` is
-    `[{"text", "intent", "connection": None}, ...]`, in the exact order
-    app.graph._generate_operation_questions wants results back in (the
-    prompt's own rule 1 preserves input order, and rule 15 guarantees one
-    result per input operation — no id round-trip needed, the caller matches
-    positionally)."""
+) -> list[ResolutionItem]:
+    """Every operation this turn that classify_operations left with
+    connection is None, confusion is True, or both, resolved in ONE batched
+    call — replaces the old generate_clarification_question (one call per
+    op) and resolve_room_connections (room-only). `operations` is
+    `[{"id", "text", "intent", "connection", "confusion", "confusion_note"}, ...]`.
+    Results are grouped by `id` by the caller (app.graph._generate_operation_questions),
+    NOT positionally — an operation needing both a room and content question
+    comes back as two ResolutionItems sharing one id."""
     last_exc: Optional[InstructorRetryException] = None
     for max_retries in (0, 4):
         try:
-            return await _resolve_room_connections_raw(tree_text, operations, max_retries, capture=capture)
+            return await _resolve_operations_raw(tree_text, operations, max_retries, capture=capture)
         except InstructorRetryException as exc:
-            salvaged = await _salvage_room_resolutions(exc, capture=capture)
+            salvaged = await _salvage_resolutions(exc, capture=capture)
             if salvaged is not None:
                 return salvaged
             last_exc = exc
     raise last_exc
 
 
-async def _resolve_room_connections_raw(
+async def _resolve_operations_raw(
     tree_text: str,
     operations: list[dict],
     max_retries: int,
     capture: dict | None = None,
-) -> list[RoomResolutionItem]:
+) -> list[ResolutionItem]:
     operations_json = json.dumps(operations, indent=2)
     messages = [
-        {"role": "system", "content": prompts.room_resolution_agent_system(tree_text, operations_json)},
-        {"role": "user", "content": prompts.room_resolution_agent_user()},
+        {"role": "system", "content": prompts.resolution_agent_system(tree_text, operations_json)},
+        {"role": "user", "content": prompts.resolution_agent_user()},
     ]
     if capture is not None:
         capture["messages"] = messages
     result, completion = await structured_client.chat.completions.create_with_completion(
         model=settings.model_intent_classifier,
-        response_model=RoomResolutionBatch,
-        max_tokens=1024,
+        response_model=ResolutionBatch,
+        # See the matching comment in _classify_operations_raw — this batch
+        # can carry a "room" AND "content" ResolutionItem per open
+        # operation, so it needs the same headroom for a message that splits
+        # into many operations.
+        max_tokens=4096,
         max_retries=max_retries,
         messages=messages,
         extra_body=_REASONING_KWARGS,
@@ -347,153 +353,341 @@ async def _resolve_room_connections_raw(
     return result.resolutions
 
 
-class AdditionalRoomBudget(BaseModel):
-    """A budget/requirement figure for a room OTHER than the one already
-    detailed in roomType/budgetOrRequirement this turn. Exists because a
-    single message can state a figure for a second room the extraction
-    schema otherwise has no slot for — without this, the model either
-    duplicated a JSON key or invented a nonexistent field name trying to
-    represent it (both live-observed via Langfuse), corrupting or silently
-    losing that room's figure."""
+# ---------------------------------------------------------------------------
+# resolve_context_confusion — the resume-turn answer resolver
+# (app.prompts.RESOLVE_CONTEXT_CONFUSSION). Takes every operation still
+# holding the turn after a resume (a free-text answer, or any operation that
+# had a confusion:true question pending — see app.graph.classify_intent_node's
+# resume branch for why those never take the cheap deterministic-merge path)
+# plus each of its pending room/content question(s) and the user's answer,
+# and returns ONE finalized operation per input — connection guaranteed
+# non-null, confusion guaranteed false. No "still open" outcome exists.
+# ---------------------------------------------------------------------------
 
-    roomType: str = Field(description="the OTHER room this figure is for, e.g. 'kitchen' — user's own words are fine")
-    budgetOrRequirement: str = Field(description="that room's own figure, e.g. '4 lakh' or '$8k'")
+
+class PendingResolution(BaseModel):
+    resolution_type: Literal["room", "content"]
+    question: str
+    # Room options carry a precomputed "connection_path" (app.graph
+    # attaches it from the live tree before this call — see
+    # RESOLVE_CONTEXT_CONFUSSION's own note not to reconstruct it); content
+    # options don't. Left as plain dicts (not Option) since the shape
+    # differs from resolve_operations' own Option and is call-site-specific.
+    options: list[dict] = Field(default_factory=list)
+    user_answer: str
 
 
-class ExtractedFields(BaseModel):
-    """One turn's worth of extraction: project-level fields plus the fields of
-    whichever single room the message was about, if any. app/graph.py decides
-    which RoomContext this applies to (matching on roomType, or starting a new
-    room) — this model itself has no notion of which room it's for.
+class OperationToResolve(BaseModel):
+    id: str
+    original_operation: dict
+    pending_resolutions: list[PendingResolution] = Field(default_factory=list)
 
-    Field-specific guidance lives in each Field's description (part of the
-    tool-call JSON schema instructor sends), not in the system prompt — for
-    the small Turbo model used here, a longer system prompt measurably raised
-    the rate of it drifting into replying with a literal '<function=...>'
-    text block instead of a real tool call, which instructor's TOOLS mode
-    then can't parse at all. Keep the system prompt short; put detail here."""
 
-    projectType: Optional[str] = Field(None, description="new construction, renovation, or a partial refresh/update")
+class ResolvedOperation(BaseModel):
+    id: str
+    reasoning: str = ""
+    text: str
+    intent: str
+    connection: str
+    confusion: bool = False
+    confusion_note: Optional[str] = None
+
+
+class ResolvedOperationBatch(BaseModel):
+    resolved_operations: list[ResolvedOperation] = Field(default_factory=list)
+
+
+async def _salvage_resolved_operations(
+    exc: InstructorRetryException, capture: dict | None = None
+) -> Optional[list[ResolvedOperation]]:
+    """Same recovery strategy as _salvage_resolutions/_salvage_operations."""
+    for attempt in exc.failed_attempts or []:
+        completion = getattr(attempt, "completion", None)
+        if not completion or not completion.choices:
+            continue
+        message = completion.choices[0].message
+
+        raw: Optional[str] = None
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            raw = tool_calls[0].function.arguments
+        elif message.content:
+            content = message.content
+            start, end = content.find("{"), content.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                raw = content[start : end + 1]
+
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+            result = ResolvedOperationBatch.model_validate(payload)
+        except (ValueError, TypeError):
+            continue
+        if capture is not None:
+            capture["raw_output"] = raw
+        return result.resolved_operations
+    return None
+
+
+async def resolve_context_confusion(
+    tree_text: str,
+    operations: list[dict],
+    *,
+    capture: dict | None = None,
+) -> list[ResolvedOperation]:
+    """`operations` is `[OperationToResolve.model_dump(), ...]`. Every
+    returned ResolvedOperation is fully resolved — connection non-null,
+    confusion false — so app.graph's resume branch never needs a further
+    branch after merging these back into `tasks` by id."""
+    last_exc: Optional[InstructorRetryException] = None
+    for max_retries in (0, 4):
+        try:
+            return await _resolve_context_confusion_raw(tree_text, operations, max_retries, capture=capture)
+        except InstructorRetryException as exc:
+            salvaged = await _salvage_resolved_operations(exc, capture=capture)
+            if salvaged is not None:
+                return salvaged
+            last_exc = exc
+    raise last_exc
+
+
+async def _resolve_context_confusion_raw(
+    tree_text: str,
+    operations: list[dict],
+    max_retries: int,
+    capture: dict | None = None,
+) -> list[ResolvedOperation]:
+    operations_json = json.dumps(operations, indent=2)
+    messages = [
+        {"role": "system", "content": prompts.resolve_context_confusion_system(tree_text, operations_json)},
+        {"role": "user", "content": prompts.resolve_context_confusion_user()},
+    ]
+    if capture is not None:
+        capture["messages"] = messages
+    result, completion = await structured_client.chat.completions.create_with_completion(
+        model=settings.model_intent_classifier,
+        response_model=ResolvedOperationBatch,
+        # See the matching comment in _classify_operations_raw.
+        max_tokens=4096,
+        max_retries=max_retries,
+        messages=messages,
+        extra_body=_REASONING_KWARGS,
+    )
+    if capture is not None:
+        capture["raw_output"] = _raw_completion_text(completion)
+    return result.resolved_operations
+
+
+# ---------------------------------------------------------------------------
+# resolve_context_changes — the pipeline's single combined call covering
+# every CONTEXT_UPDATE and CONTEXT_DELETE operation in a turn (see
+# app.pipeline._run_first_action). Replaces the old per-message extract_fields
+# + extract_graph_links pair AND app.canonical_mapper.resolve_deletion_target's
+# embedding-similarity delete matching — deletion targets are picked directly
+# from the live tree text here instead.
+#
+# Deliberately narrower than the old ExtractedFields: classify_operations has
+# already split a multi-room message into separate, individually-grounded
+# operations (each with its own `connection`), so this schema never needs to
+# juggle a SECOND room's figure in the same result the way the old
+# additionalRoomBudgets/mentionedAdditionalRooms had to — a second room's
+# figure is just another operation in the same batch, with its own
+# connection. Room identity itself is never re-derived here either: the
+# caller resolves each operation's room from its own `connection` via
+# app.canonical_mapper.split_connection, same as every other write path.
+# ---------------------------------------------------------------------------
+
+
+class MaterialChange(BaseModel):
+    item: str
+    material: str
+    specification: Optional[str] = None
+
+
+class ContextChangeFields(BaseModel):
+    """Structured field values for ONE CONTEXT_UPDATE operation, scoped to
+    that operation's own room (resolved separately from `connection`, not
+    here)."""
+
+    projectType: Optional[str] = Field(
+        None, description="new construction, renovation, or a partial refresh/update — only when this operation is Project-scoped"
+    )
     overallBudget: Optional[str] = Field(
-        None,
-        description=(
-            "ONLY the TOTAL/whole-project budget across every room combined, "
-            "e.g. 'the total budget is 15 lakh' -> '15 lakh'. Never a single "
-            "room's own figure, even if that room happens to be the one named "
-            "in roomType — a figure tied to one specific room (named or not) "
-            "always belongs in budgetOrRequirement or additionalRoomBudgets "
-            "instead, never here."
-        ),
+        None, description="the TOTAL/whole-project budget — only when this operation is Project-scoped, never a single room's own figure"
     )
-    timeline: Optional[str] = None
-    moreRoomsPending: Optional[bool] = Field(
-        None, description="true/false ONLY if the user directly answered whether other rooms are in scope"
-    )
-    roomType: Optional[str] = Field(None, description="e.g. kitchen, living room, bedroom — user's own words are fine")
-    budgetOrRequirement: Optional[str] = Field(
-        None,
-        description=(
-            "budget or need for THIS one room (the roomType above) "
-            "specifically, e.g. '$8k' or a plain description — never the "
-            "whole-project total (that's overallBudget) and never a figure "
-            "that actually belongs to a DIFFERENT room (that's "
-            "additionalRoomBudgets). If the message gives a room name no "
-            "figure of its own, or two different figures for two different "
-            "rooms, pick whichever room has the most detail as roomType/"
-            "budgetOrRequirement and route the other room's own figure to "
-            "additionalRoomBudgets — never invent a new field name and never "
-            "let two different figures collide into this one field."
-        ),
-    )
-    additionalRoomBudgets: Optional[list[AdditionalRoomBudget]] = Field(
-        None,
-        description=(
-            "A budget/requirement figure stated for a room OTHER than the one "
-            "already detailed in roomType/budgetOrRequirement — e.g. roomType "
-            "is 'living room' but the message ALSO gives a figure for "
-            "'kitchen': put {roomType: 'kitchen', budgetOrRequirement: '4 "
-            "lakh'} here. One entry per additional room that has its own "
-            "figure. Do not repeat the primary room here, and do not repeat "
-            "these rooms in mentionedAdditionalRooms.\n"
-            "Worked example: \"total's around 15 lakh, maybe 4 for the "
-            "kitchen, still deciding on the bedroom\" with roomType left as "
-            "whatever room the message is actually centered on -> "
-            "overallBudget='around 15 lakh' (hedge kept, never nulled), "
-            "additionalRoomBudgets=[{roomType: 'kitchen', "
-            "budgetOrRequirement: 'maybe 4 lakh'}], and 'bedroom' goes in "
-            "mentionedAdditionalRooms since it has no figure of its own yet — "
-            "never invent one for it."
-        ),
-    )
+    timeline: Optional[str] = Field(None, description="only when this operation is Project-scoped")
+    budgetOrRequirement: Optional[str] = Field(None, description="budget or need for THIS operation's own room specifically")
     style: Optional[str] = None
     squareFootage: Optional[float] = None
     existingFurniture: Optional[str] = None
-    materials: Optional[list[MaterialSpec]] = Field(
-        None, description="items newly mentioned this message only, e.g. {item: 'flooring', material: 'oak wood'}"
+    materials: Optional[list[MaterialChange]] = Field(None, description="items newly mentioned in THIS operation only")
+
+
+class FreeformEntityChange(BaseModel):
+    raw_entity: str = Field(description="the entity as the user described it, e.g. 'walnut TV cabinet'")
+    node_type_hint: Optional[Literal["Materials", "Furniture", "Attributes", "Constraints", "ClientPreferences"]] = Field(
+        None, description="best-guess category for a NEW entity (existing_path null) — leave null if genuinely unclear, it will be inferred downstream"
     )
-    mentionedAdditionalRooms: Optional[list[str]] = Field(
+    # existing_path/field/value: the entity-edit path — mirrors
+    # deletion_targets' own "exact path copied verbatim, never invented"
+    # contract (see app.pipeline._apply_update, which writes `field` on the
+    # entity at `existing_path` directly rather than routing through
+    # canonical_mapper.map_to_canonical). Left null (the default) for a
+    # genuinely new mention, which still goes through map_to_canonical's
+    # algorithmic alias/embedding dedup exactly as before.
+    existing_path: Optional[str] = Field(
         None,
         description=(
-            "Other room types mentioned in this message that have NO figure "
-            "of their own (a room WITH its own figure goes in "
-            "additionalRoomBudgets instead, not here) besides the one already "
-            "being detailed above (roomType/budgetOrRequirement/style/etc.) — "
-            "names only, e.g. ['bedroom', 'kitchen']. Use this when the user "
-            "lists several rooms in one message but only gives detailed facts "
-            "about one of them; the others get asked about individually on a "
-            "later turn. Do not repeat the room already covered by roomType here."
+            "exact canonical path copied verbatim from CURRENT DATA TREE if this mention refers to an entity that "
+            "ALREADY EXISTS there (the user is editing it, not introducing something new) — null for a genuinely "
+            "new mention. Never invent a path; if you're not confident the entity is the same one shown in the "
+            "tree, leave this null instead of guessing."
+        ),
+    )
+    field: Optional[Literal["Label", "Material", "Specification", "Quantity", "Notes"]] = Field(
+        None,
+        description="set together with `value` ONLY when existing_path is set and the user is changing one specific leaf of that entity — both null otherwise",
+    )
+    value: Optional[str] = Field(None, description="the new value for `field` — set together with `field`, both null otherwise")
+    # Composite-entity support (Parts/Properties/Quantity). When the
+    # operation's `connection` points at an existing freeform instance (e.g.
+    # "Rooms.<id>.Furniture.beds") AND the text attaches something TO that
+    # instance ("add a bedcover to the bed"), emit the attached thing as a
+    # `parts` entry — app.pipeline._apply_update routes each part through
+    # canonical_mapper.map_part_to_canonical, nesting it under the parent
+    # instance's Parts container instead of as a sibling under the room.
+    # `quantity` is the user-stated count for THIS entity itself ("two
+    # pillows" -> "2"); `properties` are named key/value attributes (color,
+    # finish, fabric) not covered by the typed leaf fields. All three are
+    # additive on top of the existing edit/new-mention shape — a plain
+    # non-composite mention leaves them empty/null exactly as before.
+    quantity: Optional[str] = Field(
+        None, description="a count the user stated for THIS entity, as a string (e.g. 'two pillows' -> '2') — null when no count was given"
+    )
+    properties: list["PropertyChange"] = Field(
+        default_factory=list,
+        description="named key/value attributes for this entity (color, finish, fabric, etc.) not covered by the typed leaf fields — empty when none stated",
+    )
+    parts: list["PartChange"] = Field(
+        default_factory=list,
+        description="physical sub-components attached TO this entity (a sofa's cover, a bed's bedcover, pillows on top of it) — one level only. Empty when the mention is not composite.",
+    )
+
+
+class PropertyChange(BaseModel):
+    """A named key/value attribute attached to a freeform entity or one of
+    its parts — color, finish, fabric, or any ad-hoc property. Generic by
+    design (no per-attribute typed field): `name` is the property's own
+    name ("color"), `value` is its value ("red"). app.pipeline writes each
+    as a Properties.<slug> instance (Label=name, Value=value) nested under
+    the entity/part via canonical_mapper.map_property_to_canonical."""
+    name: str = Field(description="the property's name, e.g. 'color', 'finish', 'fabric'")
+    value: str = Field(description="the property's value, e.g. 'red', 'matte', 'velvet'")
+
+
+class PartChange(BaseModel):
+    """A physical sub-component attached to a parent freeform entity — a
+    sofa's cover, a bed's bedcover, pillows on top of something. ONE LEVEL
+    ONLY: this model deliberately has NO `parts` field, so a sub-component
+    of a part (e.g. 'pillow with a zipper') is folded into the part's own
+    `properties`/`quantity`/`notes` rather than nesting further — enforced
+    structurally, not just by prompt. `existing_path` mirrors
+    FreeformEntityChange.existing_path for editing an existing part's leaf
+    (Label/Material/Quantity/Notes); null for a genuinely new part."""
+    raw_entity: str = Field(description="the part as the user described it, e.g. 'bedcover', 'velvet cover'")
+    material: Optional[str] = Field(None, description="the material/finish stated for this part, e.g. 'velvet' — null when none stated")
+    quantity: Optional[str] = Field(
+        None, description="a count the user stated for this part, as a string ('two pillows' -> '2') — null when no count was given"
+    )
+    properties: list[PropertyChange] = Field(
+        default_factory=list,
+        description="named key/value attributes for this part — same shape as FreeformEntityChange.properties",
+    )
+    existing_path: Optional[str] = Field(
+        None,
+        description=(
+            "exact canonical path copied verbatim from CURRENT DATA TREE if this part ALREADY EXISTS under its "
+            "parent and the user is editing one of its leaves — null for a genuinely new part. Never invent a path."
+        ),
+    )
+    field: Optional[Literal["Label", "Material", "Quantity", "Notes"]] = Field(
+        None,
+        description="set together with `value` ONLY when existing_path is set and the user is editing one specific leaf of that part — both null otherwise",
+    )
+    value: Optional[str] = Field(None, description="the new value for `field` — set together with `field`, both null otherwise")
+
+
+FreeformEntityChange.model_rebuild()
+PartChange.model_rebuild()
+
+
+class ContextChangeResult(BaseModel):
+    text: str = Field(description="copied from the input operation's own text")
+    intent: Literal["CONTEXT_UPDATE", "CONTEXT_DELETE"] = Field(description="copied from the input operation's own intent")
+    fields: ContextChangeFields = Field(default_factory=ContextChangeFields, description="CONTEXT_UPDATE only — leave every field null for CONTEXT_DELETE")
+    freeform_entities: list[FreeformEntityChange] = Field(
+        default_factory=list, description="CONTEXT_UPDATE only — materials/furniture/attributes/constraints/preferences not covered by `fields`"
+    )
+    deletion_targets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "CONTEXT_DELETE only — exact canonical path(s) copied verbatim from CURRENT DATA TREE that this "
+            "operation retracts. Empty if no confident target exists in the tree. Never invent a path."
         ),
     )
 
 
-def _raw_completion_text(completion) -> str:
-    """Best-effort raw text of a chat completion — the tool-call arguments
-    JSON when the model made a real tool call (TOOLS mode structured output),
-    else plain message content."""
-    try:
-        message = completion.choices[0].message
-    except (AttributeError, IndexError, TypeError):
-        return ""
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        return tool_calls[0].function.arguments
-    return message.content or ""
+class ContextChangeBatch(BaseModel):
+    results: list[ContextChangeResult] = Field(default_factory=list)
 
 
-def _salvage_extracted_fields(
-    exc: InstructorRetryException, message: str, capture: dict | None = None
-) -> Optional[ExtractedFields]:
-    """Recovers the answer instructor's strict TOOLS-mode parser discarded.
+class ContextChangeValidationError(BaseModel):
+    """One semantic-validation failure from _validate_context_changes — see
+    that function's docstring. `index` is the position within whichever list
+    `kind` names (deletion_targets / freeform_entities / parts) on
+    results[result_index]. For kind="part", `entity_index` names which
+    freeform_entities entry the part belongs to (parts are nested, so a
+    single int isn't enough to locate them); null for the other kinds."""
 
-    Live-observed: this model's FIRST attempt almost always arrives correctly
-    filled in but as its own native '<function=Name>{...}</function>' text
-    syntax (see the comment below) instead of a real tool call, which TOOLS
-    mode rejects outright — and every retry after that degrades to a fully
-    empty completion rather than recovering (also live-observed, consistently
-    across repeated failures), so without this, a turn's real answer was
-    being thrown away and silently dropped instead of saved. Scans every
-    failed attempt's raw text for a JSON object and validates it against the
-    real schema; if nothing parses, the caller's caller falls back to
-    extract_fields_node's existing skip-this-turn handling."""
+    result_index: int
+    kind: Literal["deletion_target", "freeform_entity", "part"]
+    index: int
+    detail: str
+    entity_index: Optional[int] = None
+
+
+async def _salvage_context_changes(
+    exc: InstructorRetryException, capture: dict | None = None
+) -> Optional[list[ContextChangeResult]]:
+    """Same recovery strategy as _salvage_room_resolutions — scans every
+    failed attempt for a real tool call or a JSON array/object embedded in
+    plain text content, so a parse hiccup doesn't silently drop the whole
+    batch's worth of context changes."""
     for attempt in exc.failed_attempts or []:
         completion = getattr(attempt, "completion", None)
-        content = completion.choices[0].message.content if completion and completion.choices else None
-        if not content:
+        if not completion or not completion.choices:
             continue
-        start, end = content.find("{"), content.rfind("}")
-        if start == -1 or end == -1 or end <= start:
+        message = completion.choices[0].message
+
+        raw: Optional[str] = None
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            raw = tool_calls[0].function.arguments
+        elif message.content:
+            content = message.content
+            start = min((i for i in (content.find("["), content.find("{")) if i != -1), default=-1)
+            end = max(content.rfind("]"), content.rfind("}"))
+            if start != -1 and end != -1 and end > start:
+                raw = content[start : end + 1]
+
+        if not raw:
             continue
-        raw = content[start : end + 1]
-        duplicates = _duplicate_json_keys(raw)
-        if duplicates:
-            logger.warning(
-                "extract_fields salvage: duplicate key(s) %s in model output for message %r — "
-                "only the LAST value survives JSON parsing, earlier value(s) silently lost. raw=%s",
-                duplicates, message[:200], raw[:500],
-            )
         try:
-            result = ExtractedFields.model_validate_json(raw)
-        except ValueError:
+            payload = json.loads(raw)
+            items = payload["results"] if isinstance(payload, dict) else payload
+            result = [ContextChangeResult.model_validate(item) for item in items]
+        except (ValueError, TypeError, KeyError):
             continue
         if capture is not None:
             capture["raw_output"] = raw
@@ -501,367 +695,288 @@ def _salvage_extracted_fields(
     return None
 
 
-async def extract_fields(message: str, known: dict, *, capture: dict | None = None) -> ExtractedFields:
-    # Filter out unset fields before formatting into the prompt. Showing a dict
-    # with every field explicitly set to None (e.g. "Known so far: {'roomType':
-    # None, ...}") reliably confused a non-reasoning model into extracting
-    # nothing at all — reproducibly, not flaky — even though the exact same
-    # message alone extracts correctly. Only showing fields that are actually
-    # known is unambiguous for any model.
-    known = {k: v for k, v in known.items() if v is not None}
+def _validate_context_changes(
+    results: list[ContextChangeResult],
+    existing_paths: set[str],
+    node_types_by_path: dict[str, str],
+) -> list[ContextChangeValidationError]:
+    """Semantic validation beyond Pydantic's structural checks — the LLM
+    only ever names two kinds of path in this schema (deletion_targets,
+    freeform_entities[].existing_path), so this only checks those actually
+    exist in the CURRENT DATA TREE snapshot the caller fetched, plus that an
+    entity edit's `field` is legal for that entity's own node_type
+    (app.canonical_mapper.legal_fields). node_type/intent legality is
+    already a closed Pydantic Literal — nothing to re-check there. Pure:
+    reads only what's passed in, same as every other function in this
+    module never touching graph_store directly — the caller
+    (app.pipeline._run_first_action) is the one with DB access."""
+    from app import canonical_mapper  # lazy: canonical_mapper imports this module for embed(), avoid a load-time cycle
 
-    # Two-stage retry strategy, confirmed by a live Langfuse trace: this
-    # model's first attempt almost always already has the right answer, just
-    # wrapped in its own '<function=...>{...}</function>' text syntax instead
-    # of a real tool call — instructor's TOOLS mode sees no populated
-    # tool_calls field and treats that as "no call made" regardless of what
-    # the text contains, then retries. But every retry after the first tends
-    # to degrade into a near-empty completion instead of recovering (also
-    # live-observed — see the trace: attempt 1 returned 70 output tokens,
-    # attempts 2-9 returned 1-4 each), so spending the full retry budget
-    # before ever checking whether attempt 1 was salvageable wastes most of a
-    # turn's latency (12s of a 20s turn, observed) for no benefit. Try a
-    # single attempt first and salvage its raw text immediately on failure;
-    # only fall back to the full remaining retry budget — genuinely rare,
-    # attempt 1 not even salvageable — if that comes up empty. Same total
-    # attempt ceiling either way (1 + 8 = 9, same as the previous flat
-    # max_retries=8).
+    issues: list[ContextChangeValidationError] = []
+    for i, result in enumerate(results):
+        for j, path in enumerate(result.deletion_targets):
+            if path not in existing_paths:
+                issues.append(ContextChangeValidationError(
+                    result_index=i, kind="deletion_target", index=j,
+                    detail=f'"{path}" does not exist in CURRENT DATA TREE',
+                ))
+        for j, mention in enumerate(result.freeform_entities):
+            if mention.existing_path is None:
+                if mention.field is not None:
+                    issues.append(ContextChangeValidationError(
+                        result_index=i, kind="freeform_entity", index=j,
+                        detail=f'field="{mention.field}" set without existing_path',
+                    ))
+                continue
+            if mention.existing_path not in existing_paths:
+                issues.append(ContextChangeValidationError(
+                    result_index=i, kind="freeform_entity", index=j,
+                    detail=f'existing_path "{mention.existing_path}" does not exist in CURRENT DATA TREE',
+                ))
+            elif mention.field is not None:
+                node_type = node_types_by_path.get(mention.existing_path)
+                allowed = canonical_mapper.legal_fields(node_type) if node_type else []
+                if mention.field not in allowed:
+                    issues.append(ContextChangeValidationError(
+                        result_index=i, kind="freeform_entity", index=j,
+                        detail=f'field="{mention.field}" is not legal for "{mention.existing_path}" (node_type={node_type!r}); allowed: {allowed}',
+                    ))
+            # Parts: a part's existing_path must be a real path in the tree
+            # AND its field (if set) legal for the Parts node_type. Same
+            # contract as the entity-level check above, just one level down —
+            # the LLM only ever names existing_path on a PartChange when it
+            # is editing an existing part's leaf, never to claim a parent.
+            # kind="part" + entity_index=j so _drop_invalid_claims removes
+            # just the bad part, not the whole parent mention.
+            for k, part in enumerate(mention.parts):
+                if part.existing_path is None:
+                    if part.field is not None:
+                        issues.append(ContextChangeValidationError(
+                            result_index=i, kind="part", index=k, entity_index=j,
+                            detail=f'parts[{k}].field="{part.field}" set without existing_path',
+                        ))
+                    continue
+                if part.existing_path not in existing_paths:
+                    issues.append(ContextChangeValidationError(
+                        result_index=i, kind="part", index=k, entity_index=j,
+                        detail=f'parts[{k}].existing_path "{part.existing_path}" does not exist in CURRENT DATA TREE',
+                    ))
+                elif part.field is not None:
+                    node_type = node_types_by_path.get(part.existing_path)
+                    allowed = canonical_mapper.legal_fields(node_type) if node_type else []
+                    if part.field not in allowed:
+                        issues.append(ContextChangeValidationError(
+                            result_index=i, kind="part", index=k, entity_index=j,
+                            detail=f'parts[{k}].field="{part.field}" is not legal for "{part.existing_path}" (node_type={node_type!r}); allowed: {allowed}',
+                        ))
+    return issues
+
+
+def _drop_invalid_claims(results: list[ContextChangeResult], issues: list[ContextChangeValidationError]) -> None:
+    """Mutates `results` in place, removing exactly the claims `issues`
+    flagged — a bad deletion_targets entry is removed from that list; a
+    freeform_entities mention with a bad existing_path/field is dropped
+    entirely (never silently re-purposed into a create — the user's text was
+    about editing something that already exists, so falling through to
+    map_to_canonical would create something they never asked for)."""
+    by_result: dict[int, list[ContextChangeValidationError]] = {}
+    for issue in issues:
+        by_result.setdefault(issue.result_index, []).append(issue)
+
+    for i, result_issues in by_result.items():
+        result = results[i]
+        bad_deletion_indices = {issue.index for issue in result_issues if issue.kind == "deletion_target"}
+        if bad_deletion_indices:
+            result.deletion_targets = [p for j, p in enumerate(result.deletion_targets) if j not in bad_deletion_indices]
+        bad_entity_indices = {issue.index for issue in result_issues if issue.kind == "freeform_entity"}
+        if bad_entity_indices:
+            result.freeform_entities = [m for j, m in enumerate(result.freeform_entities) if j not in bad_entity_indices]
+        # Parts are nested under a freeform_entity, so drop the bad part from
+        # its parent's `parts` list (not the whole parent mention) — group by
+        # entity_index so one pass per parent mutates its list in place.
+        part_issues_by_entity: dict[int, set[int]] = {}
+        for issue in result_issues:
+            if issue.kind == "part" and issue.entity_index is not None:
+                part_issues_by_entity.setdefault(issue.entity_index, set()).add(issue.index)
+        for entity_index, bad_part_indices in part_issues_by_entity.items():
+            if entity_index < len(result.freeform_entities):
+                mention = result.freeform_entities[entity_index]
+                mention.parts = [p for k, p in enumerate(mention.parts) if k not in bad_part_indices]
+
+
+def _format_validation_issues(operations: list[dict], issues: list[ContextChangeValidationError]) -> str:
+    lines = []
+    for issue in issues:
+        op_text = operations[issue.result_index].get("text", "") if issue.result_index < len(operations) else "?"
+        lines.append(f'- operation {issue.result_index} ("{op_text}"), {issue.kind} #{issue.index}: {issue.detail}')
+    return "\n".join(lines)
+
+
+async def resolve_context_changes(
+    tree_text: str,
+    operations: list[dict],
+    existing_paths: set[str],
+    node_types_by_path: dict[str, str],
+    *,
+    capture: dict | None = None,
+) -> tuple[list[ContextChangeResult], list[ContextChangeValidationError]]:
+    """Every CONTEXT_UPDATE/CONTEXT_DELETE operation in this turn, resolved
+    in ONE batched call — `operations` is
+    `[{"text", "intent", "connection"}, ...]`, in the exact order results
+    come back in (positional matching, no id round-trip needed, same
+    convention resolve_room_connections already uses).
+
+    Two validation layers, matching the function-calling-implementation
+    guide's design: `_resolve_context_changes_structural` below is Pydantic/
+    instructor's structural contract (unchanged retry+salvage behavior);
+    `_validate_context_changes` is the semantic layer on top of that (does a
+    claimed path actually exist? is a claimed field legal for it?). On a
+    semantic failure, ONE retry is made with the exact validation error fed
+    back into the prompt; anything still invalid after that retry has its
+    specific bad claim(s) dropped (app.pipeline never sees a path it should
+    trust that wasn't actually verified) — the caller surfaces the returned
+    issues however it sees fit (app.pipeline._run_first_action turns each
+    into a `changes` entry with action="failed"). Never raises for a
+    semantic failure — only a structural failure that survives both the
+    instructor retry budget AND salvage still propagates as
+    InstructorRetryException, same as before this validation layer existed."""
+    results = await _resolve_context_changes_structural(tree_text, operations, capture=capture)
+
+    issues = _validate_context_changes(results, existing_paths, node_types_by_path)
+    if not issues:
+        return results, []
+
+    logger.warning(
+        "resolve_context_changes: %d validation issue(s) on first attempt, retrying once — %s",
+        len(issues), [i.detail for i in issues],
+    )
+    error_summary = _format_validation_issues(operations, issues)
+    retry_results = await _resolve_context_changes_structural(tree_text, operations, capture=capture, validation_errors=error_summary)
+
+    retry_issues = _validate_context_changes(retry_results, existing_paths, node_types_by_path)
+    if retry_issues:
+        logger.warning(
+            "resolve_context_changes: %d validation issue(s) still present after retry, dropping those claims — %s",
+            len(retry_issues), [i.detail for i in retry_issues],
+        )
+        _drop_invalid_claims(retry_results, retry_issues)
+    return retry_results, retry_issues
+
+
+async def _resolve_context_changes_structural(
+    tree_text: str,
+    operations: list[dict],
+    *,
+    validation_errors: Optional[str] = None,
+    capture: dict | None = None,
+) -> list[ContextChangeResult]:
+    """The structural (Pydantic/instructor) retry+salvage loop — unchanged
+    behavior from before the semantic validation layer existed, just
+    factored out so resolve_context_changes can call it twice (once clean,
+    once with a validation_errors block appended for the semantic-retry
+    pass)."""
     last_exc: Optional[InstructorRetryException] = None
-    for max_retries in (0, 7):
+    for max_retries in (0, 4):
         try:
-            return await _extract_fields_raw(message, known, max_retries, capture=capture)
+            return await _resolve_context_changes_raw(tree_text, operations, max_retries, validation_errors=validation_errors, capture=capture)
         except InstructorRetryException as exc:
-            salvaged = _salvage_extracted_fields(exc, message, capture=capture)
+            salvaged = await _salvage_context_changes(exc, capture=capture)
             if salvaged is not None:
                 return salvaged
             last_exc = exc
     raise last_exc
 
 
-async def _extract_fields_raw(
-    message: str, known: dict, max_retries: int, capture: dict | None = None
-) -> ExtractedFields:
-    messages = [
-        {"role": "system", "content": prompts.EXTRACT_FIELDS_SYSTEM},
-        {"role": "user", "content": prompts.extract_fields_user(known, message)},
-    ]
-    if capture is not None:
-        capture["messages"] = messages
-    result, completion = await structured_client.chat.completions.create_with_completion(
-        model=settings.model_extraction,
-        response_model=ExtractedFields,
-        # Without a cap, a message with nothing to extract (e.g. a question
-        # like "what is the cost for kitchen" instead of new project info) was
-        # observed to send generation into a multi-minute stall in tool-calling
-        # mode — the same class of unbounded-output issue as generate_question
-        # and extract_graph_links, just never hit here until now. A small JSON
-        # object never needs anywhere near this many tokens.
-        max_tokens=1024,
-        # Caller-controlled: extract_fields calls this twice, first cheaply
-        # (max_retries=0, a single attempt) then with the remaining budget
-        # only if that attempt's raw text wasn't salvageable — see the
-        # comment there for why. The fast Turbo model swapped in for latency
-        # (see config.py) is live-measured at only ~65-70% raw success per
-        # attempt at emitting a real tool call in instructor's TOOLS mode (vs.
-        # ~100% but 30-75s/call for the slower model previously here).
-        max_retries=max_retries,
-        messages=messages,
-        extra_body=_REASONING_KWARGS,
-    )
-    if capture is not None:
-        capture["raw_output"] = _raw_completion_text(completion)
-    return result
-
-
-class GraphNodeCreate(BaseModel):
-    id: str = Field(
-        description=(
-            "Short unique snake_case slug for this node, e.g. 'style_modern' or "
-            "'accent_navy'. Never use this for the project or a room/budget — "
-            "those already exist as anchors; reference their given id instead "
-            "of creating a new node for them."
-        )
-    )
-    label: str = Field(description="Human-readable label, e.g. 'Modern style' or 'Navy accent wall'.")
-    type: Literal["room", "preference", "constraint", "attribute", "entity"] = "attribute"
-
-
-class GraphEdgeCreate(BaseModel):
-    source: str = Field(description="id of the source node — an anchor id, a recent node's id, or a new node's id from this response")
-    target: str = Field(description="id of the target node — an anchor id, a recent node's id, or a new node's id from this response")
-    relation: GraphRelation = Field(description="the relationship type connecting source to target")
-
-
-class GraphNodeRevise(BaseModel):
-    """A correction to a fact already captured by a CANDIDATE node — see the
-    'no "instead" phrasing required' worked example in app.prompts.GRAPH_SYSTEM_PROMPT.
-    app/graph.py marks the target node superseded, creates a fresh node with
-    new_label, and adds the 'revises' edge automatically — the model never
-    emits that edge itself."""
-
-    target_node_id: str = Field(
-        description=(
-            "id of the CANDIDATE node this message corrects — MUST be copied "
-            "exactly from a candidate id you were shown, never invented."
-        )
-    )
-    new_label: str = Field(description="the corrected label, e.g. 'Matte lacquer finish'")
-
-
-class GraphExtraction(BaseModel):
-    new_nodes: list[GraphNodeCreate] = Field(default_factory=list)
-    new_edges: list[GraphEdgeCreate] = Field(default_factory=list)
-    # Corrections to existing CANDIDATE nodes (see app.prompts.GRAPH_SYSTEM_PROMPT) —
-    # fires on ANY correction, not just explicit "X instead of Y" phrasing.
-    revised_nodes: list[GraphNodeRevise] = Field(default_factory=list)
-    # Facts the user withdrew with no replacement (e.g. "never mind the
-    # accent wall") — ids MUST come from the candidate list, same rule as
-    # revised_nodes.
-    retracted_node_ids: list[str] = Field(default_factory=list)
-
-
-# The only types GraphNodeCreate actually allows for a new node — anything
-# else (in practice: 'budget' or 'project', the two ANCHOR-only types the
-# model sees in its own anchor list and sometimes reaches for) gets coerced
-# to the safe default instead of failing validation outright.
-_VALID_NEW_NODE_TYPES = {"room", "preference", "constraint", "attribute", "entity"}
-
-
-def _coerce_and_validate_graph_extraction(payload: dict) -> Optional[GraphExtraction]:
-    """Fixes the one schema mismatch actually observed in production traffic
-    (see the comment on _salvage_extracted_graph_links) by coercing an
-    anchor-only type to 'attribute' before validating. Any other validation
-    problem still fails here and returns None — this is a targeted fix for a
-    known failure shape, not a blanket bypass of the schema."""
-    for node in payload.get("new_nodes") or []:
-        if isinstance(node, dict) and node.get("type") not in _VALID_NEW_NODE_TYPES:
-            node["type"] = "attribute"
-    try:
-        return GraphExtraction.model_validate(payload)
-    except ValueError:
-        return None
-
-
-def _salvage_extracted_graph_links(
-    exc: InstructorRetryException, capture: dict | None = None
-) -> Optional[GraphExtraction]:
-    """Recovers a usable result from a failed extract_graph_links call instead
-    of discarding the whole turn's graph update. Two distinct failure modes,
-    both live-observed via Langfuse:
-
-    (1) the model's answer arrives correctly filled in but as its own native
-    '<function=...>{...}</function>' text syntax instead of a real tool call,
-    which instructor's TOOLS mode rejects outright and can't parse — same
-    class of failure _salvage_extracted_fields already handles for the
-    fields path. Recovered from message.content.
-
-    (2) a real, well-formed tool call that fails schema validation on
-    new_nodes[].type — the model reaches for 'budget' or 'project' (types it
-    saw on the ANCHOR nodes it was shown) even though those aren't offered as
-    choices for a new node. Retrying with the identical request doesn't help
-    here: instructor just resends the same validation error and the model
-    repeats the identical mistake (one production trace: 6/6 retries, the
-    same 'budget' error every time, 81s spent for a result that got thrown
-    away anyway). Recovered from message.tool_calls, which the text-only
-    check above never looks at since a real tool call leaves .content empty.
-    """
-    for attempt in exc.failed_attempts or []:
-        completion = getattr(attempt, "completion", None)
-        if not completion or not completion.choices:
-            continue
-        message = completion.choices[0].message
-
-        tool_calls = getattr(message, "tool_calls", None)
-        if tool_calls:
-            arguments = tool_calls[0].function.arguments
-            duplicates = _duplicate_json_keys(arguments)
-            if duplicates:
-                logger.warning(
-                    "extract_graph_links salvage: duplicate key(s) %s in tool call arguments — "
-                    "only the LAST value survives JSON parsing. raw=%s", duplicates, arguments[:500],
-                )
-            try:
-                payload = json.loads(arguments)
-            except (ValueError, TypeError, IndexError, AttributeError):
-                payload = None
-            if payload is not None:
-                result = _coerce_and_validate_graph_extraction(payload)
-                if result is not None:
-                    if capture is not None:
-                        capture["raw_output"] = arguments
-                    return result
-
-        content = message.content
-        if content:
-            start, end = content.find("{"), content.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                raw = content[start : end + 1]
-                duplicates = _duplicate_json_keys(raw)
-                if duplicates:
-                    logger.warning(
-                        "extract_graph_links salvage: duplicate key(s) %s in model output — "
-                        "only the LAST value survives JSON parsing. raw=%s", duplicates, raw[:500],
-                    )
-                try:
-                    payload = json.loads(raw)
-                except ValueError:
-                    payload = None
-                if payload is not None:
-                    result = _coerce_and_validate_graph_extraction(payload)
-                    if result is not None:
-                        if capture is not None:
-                            capture["raw_output"] = raw
-                        return result
-    return None
-
-
-async def extract_graph_links(
-    message: str,
-    anchors: list[dict],
-    recent_nodes: list[dict],
-    recent_edges: list[dict],
-    *,
-    capture: dict | None = None,
-) -> tuple[GraphExtraction, str]:
-    """Returns (extraction, status) where status is "clean" (no retry needed)
-    or "salvaged" (recovered from a failed attempt's raw text) — app/graph.py
-    records this in the turn's trace. Raises InstructorRetryException if both
-    the cheap first attempt and the full retry budget are exhausted with
-    nothing salvageable; the caller (update_context_graph_node) treats that as
-    "skip this turn's LLM extraction," same as extract_fields_node already
-    does for the fields path.
-
-    anchors are bounded by room/budget count; recent_nodes (despite the
-    parameter name) is now a small top-k relevance search over the ENTIRE
-    active graph rather than a recency slice (see app/graph.py::get_candidates)
-    — this is what lets a correction to something said many turns ago still
-    resolve to its node, while recent_edges stays a small recency window for
-    continuity only. Either way the prompt stays flat instead of growing with
-    session length."""
-    last_exc: Optional[InstructorRetryException] = None
-    for max_retries in (0, 4):
-        try:
-            result = await _extract_graph_links_raw(
-                message, anchors, recent_nodes, recent_edges, max_retries, capture=capture
-            )
-            return result, "clean"
-        except InstructorRetryException as exc:
-            salvaged = _salvage_extracted_graph_links(exc, capture=capture)
-            if salvaged is not None:
-                return salvaged, "salvaged"
-            last_exc = exc
-    raise last_exc
-
-
-async def _extract_graph_links_raw(
-    message: str,
-    anchors: list[dict],
-    recent_nodes: list[dict],
-    recent_edges: list[dict],
+async def _resolve_context_changes_raw(
+    tree_text: str,
+    operations: list[dict],
     max_retries: int,
+    *,
+    validation_errors: Optional[str] = None,
     capture: dict | None = None,
-) -> GraphExtraction:
+) -> list[ContextChangeResult]:
+    operations_json = json.dumps(operations, indent=2)
     messages = [
-        {"role": "system", "content": prompts.GRAPH_SYSTEM_PROMPT},
-        {"role": "user", "content": prompts.graph_links_user(anchors, recent_nodes, recent_edges, message)},
+        {"role": "system", "content": prompts.resolve_context_changes_system(tree_text, operations_json)},
+        {"role": "user", "content": prompts.resolve_context_changes_user(validation_errors)},
     ]
     if capture is not None:
         capture["messages"] = messages
     result, completion = await structured_client.chat.completions.create_with_completion(
         model=settings.model_extraction,
-        response_model=GraphExtraction,
-        max_tokens=1024,
+        response_model=ContextChangeBatch,
+        # See the matching comment in _classify_operations_raw — this batch
+        # also fans out per operation, so the same headroom applies.
+        max_tokens=4096,
         max_retries=max_retries,
         messages=messages,
         extra_body=_REASONING_KWARGS,
     )
     if capture is not None:
         capture["raw_output"] = _raw_completion_text(completion)
+    return result.results
+
+
+# ---------------------------------------------------------------------------
+# generate_search_keywords — DATABASE_RETRIEVAL's new keyword-generation step
+# in front of app.rag.query_catalog, which today just embeds the raw message
+# verbatim. A short, low-stakes call — reuses model_question_gen (the fast
+# Turbo model), same latency posture as generate_wrapup_message/merge_response.
+# ---------------------------------------------------------------------------
+
+
+async def generate_search_keywords(query: str, *, capture: dict | None = None) -> str:
+    messages = [
+        {"role": "system", "content": prompts.SEARCH_KEYWORDS_SYSTEM},
+        {"role": "user", "content": prompts.search_keywords_user(query)},
+    ]
+    resp = await client.chat.completions.create(
+        model=settings.model_question_gen,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=64,
+        extra_body=_REASONING_KWARGS,
+    )
+    if capture is not None:
+        capture["messages"] = messages
+        capture["raw_output"] = resp.choices[0].message.content
+    return (resp.choices[0].message.content or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# generate_turn_summary — the pipeline's final join step (see
+# app.pipeline.run_pipeline): one call that turns whichever pieces this turn
+# actually produced (changes made, context retrieved, database results,
+# still-open fields) into the turn's actual reply text.
+# ---------------------------------------------------------------------------
+
+
+class TurnSummary(BaseModel):
+    database_summary: Optional[str] = Field(None, description="null if no database/catalog search happened this turn")
+    context_summary: Optional[str] = Field(None, description="null if no context retrieval happened this turn")
+    changes_summary: Optional[str] = Field(None, description="null if nothing was created/updated/deleted this turn")
+    next_message: str = Field(description="the next question to ask, or a closing/completion line if nothing is left to ask")
+    is_question: bool = Field(description="true if next_message is a question awaiting an answer, false if it's a closing/completion statement")
+
+
+async def generate_turn_summary(pieces: dict, *, capture: dict | None = None) -> TurnSummary:
+    messages = [
+        {"role": "system", "content": prompts.TURN_SUMMARY_SYSTEM},
+        {"role": "user", "content": prompts.turn_summary_user(pieces)},
+    ]
+    if capture is not None:
+        capture["messages"] = messages
+    result, completion = await structured_client.chat.completions.create_with_completion(
+        model=settings.model_question_gen,
+        response_model=TurnSummary,
+        max_tokens=768,
+        max_retries=2,
+        messages=messages,
+        extra_body=_REASONING_KWARGS,
+    )
+    if capture is not None:
+        capture["raw_output"] = _raw_completion_text(completion)
     return result
-
-
-async def generate_question(
-    field_names: list[str],
-    context: dict,
-    *,
-    is_retry: bool = False,
-    capture: dict | None = None,
-) -> str:
-    """field_names is one or more field labels to gather in a single combined
-    question — see app.prompts.question_system."""
-    messages = [
-        {"role": "system", "content": prompts.question_system(field_names, is_retry)},
-        {"role": "user", "content": prompts.question_user(context)},
-    ]
-    resp = await client.chat.completions.create(
-        model=settings.model_question_gen,
-        messages=messages,
-        temperature=0.7,
-        # GLM-4.7-Flash is a reasoning model that spends tokens on internal
-        # chain-of-thought (returned separately as reasoning_content) before
-        # emitting the final answer; too low a budget truncates before any
-        # visible content is produced (finish_reason="length", content="").
-        max_tokens=1024,
-        extra_body=_REASONING_KWARGS,
-    )
-    if capture is not None:
-        capture["messages"] = messages
-        capture["raw_output"] = resp.choices[0].message.content
-    return resp.choices[0].message.content or ""
-
-
-async def generate_wrapup_message(context: dict, *, capture: dict | None = None) -> str:
-    """The second of the two question 'types': unlike generate_question (a
-    genuine ask that needs an answer), this is a closing statement produced
-    once, when save_project_node has just finished the intake — replaces the
-    old circle-back re-ask of a skipped field with a plain acknowledgment
-    instead, since that field is being silently filled via
-    infer_missing_field rather than asked about again. Reuses
-    model_question_gen (the fast Turbo model, not model_answer) since this is
-    a short, low-stakes line, not a real answer — keeping it off the slower
-    model matters for the same latency reasons documented on model_question_gen
-    in config.py."""
-    messages = [
-        {"role": "system", "content": prompts.WRAPUP_PERSONA},
-        {"role": "user", "content": prompts.wrapup_user(context)},
-    ]
-    resp = await client.chat.completions.create(
-        model=settings.model_question_gen,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=256,
-        extra_body=_REASONING_KWARGS,
-    )
-    if capture is not None:
-        capture["messages"] = messages
-        capture["raw_output"] = resp.choices[0].message.content
-    return resp.choices[0].message.content or ""
-
-
-async def merge_response(parts: list[str], *, capture: dict | None = None) -> str:
-    """Used by app.execution.merge_task_results (Phase 11) to compose several
-    deterministic/generated pieces from one multi-task turn into one reply.
-    Reuses model_question_gen (fast Turbo model), same latency reasoning as
-    generate_wrapup_message — this is short, low-stakes composition, not a
-    real answer needing the slower model."""
-    messages = [
-        {"role": "system", "content": prompts.MERGE_PERSONA},
-        {"role": "user", "content": prompts.merge_user(parts)},
-    ]
-    resp = await client.chat.completions.create(
-        model=settings.model_question_gen,
-        messages=messages,
-        temperature=0.7,
-        max_tokens=256,
-        extra_body=_REASONING_KWARGS,
-    )
-    if capture is not None:
-        capture["messages"] = messages
-        capture["raw_output"] = resp.choices[0].message.content
-    return resp.choices[0].message.content or ""
-
-
-
 
 
 

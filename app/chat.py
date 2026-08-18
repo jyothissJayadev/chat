@@ -24,6 +24,12 @@ class ChatRequest(BaseModel):
     # event (see app.graph.classify_intent_node's resume branch) — the only
     # structured (non-message-text) reply channel this endpoint has.
     operation_answers: Optional[dict[str, str]] = None
+    # {op_id: [room_id, ...]} — set ONLY for an op_id whose chosen answer was
+    # a bundled multi-room option (app.llm.RoomResolutionOption.room_ids).
+    # operation_answers[op_id] still carries that option's display label;
+    # this is the parallel structured data app.graph.classify_intent_node's
+    # resume branch uses to fan that op out into one write task per room.
+    operation_room_selections: Optional[dict[str, list[str]]] = None
 
 
 # Some branches (e.g. update_context: extract_fields -> update_context_graph ->
@@ -46,6 +52,7 @@ async def run_chat_turn(
     message: str,
     image_url: Optional[str] = None,
     operation_answers: Optional[dict[str, str]] = None,
+    operation_room_selections: Optional[dict[str, list[str]]] = None,
 ) -> AsyncIterator[dict]:
     """Runs one full chat turn end-to-end and yields transport-agnostic event
     dicts, formatted onto the wire as SSE by the /chat endpoint below.
@@ -55,30 +62,39 @@ async def run_chat_turn(
       {"type": "token", "content": str}
       {"type": "progress", "node": str}
       {"type": "trace", "node": str, "entries": list[dict]}  # TraceEntry.model_dump() per entry
-      {"type": "operation_progress", "task_type": str, "target": str, "ok": bool}
-      {"type": "context_updated", "message": str}
-      {"type": "confirm_change", "field": str, "old_value": Any, "new_value": Any, "question": str}
-      {"type": "ask_question", "question": str}
+      {"type": "operation_progress", "stage": str, "ok": bool}
+      {"type": "pipeline_result", "database_summary": str|None, "context_summary": str|None, "changes_summary": str|None, "message": str, "is_question": bool}
       {"type": "operation_questions", "questions": list[dict]}
-      # [{"op_id", "text", "question", "options": [{"id", "label"}, ...], "allow_custom": true}, ...]
+      # [{"op_id", "text", "question", "options": [{"id", "label", "room_ids"}, ...], "allow_custom": true}, ...]
       # The viewer must render both the option list AND a free-text input for
       # each question — `allow_custom` is always true (the reply channel
       # below accepts any string per op_id, an option's own label or
-      # something the user typed).
-      {"type": "wrapup", "message": str}
+      # something the user typed). An option with "room_ids" set (2+ ids) is
+      # a bundled multi-room choice (app.llm.RoomResolutionOption) — picking
+      # it must send BOTH operation_answers[op_id]=that option's label AND
+      # operation_room_selections[op_id]=that option's room_ids on the next
+      # call, so the turn applies to every bundled room.
       {"type": "error", "message": str}
       {"type": "done", "session_id": str, "status": str}
       {"type": "heartbeat"}
 
-    `operation_progress` only fires during a multi-operation turn (see
-    app.execution.execute()) — one event per task as it finishes committing/
-    dispatching, finer-grained than the per-graph-node `progress` event above
-    (which only fires once for the whole `handle_split_intents` batch).
+    `operation_progress` fires once per pipeline stage as it completes (see
+    app.pipeline.run_pipeline: first_action / context_retrieval /
+    database_query / summary / direct_answer, whichever apply this turn) —
+    finer-grained than the per-graph-node `progress` event above (which only
+    fires once for the whole `run_pipeline` node).
+
+    `pipeline_result` is the single join-step reply for this turn — replaces
+    the old separate context_updated/ask_question/wrapup events. `message`
+    is either the next question (is_question=true) or a closing/completion
+    line (is_question=false).
 
     `operation_questions` fires when classify_intent_node couldn't ground
     one or more write operations to a graph location (see the
     classifier-connection plan) — reply on the NEXT call with
-    `operation_answers={op_id: chosen_value}` for each op_id listed."""
+    `operation_answers={op_id: chosen_value}` for each op_id listed, plus
+    `operation_room_selections={op_id: [room_id, ...]}` for any op_id whose
+    chosen value was a bundled multi-room option."""
     session = await get_or_create_session(session_id)
     history = "\n".join(f"{m.role}: {m.content}" for m in session.messages[-10:])
     graph_message = message
@@ -108,17 +124,17 @@ async def run_chat_turn(
             "active_room_id": session.active_room_id,
             "intent": [],
             "tasks": [],
-            "retrieved": "",
-            "pending_question": None,
-            "pending_gap": session.pending_gap,
             "pending_operation_questions": session.pending_operation_questions,
             "operation_answers": operation_answers,
-            "update_summary": None,
+            "operation_room_selections": operation_room_selections,
+            "pending_gap": session.pending_gap,
             "answer": "",
+            "database_summary": None,
+            "context_summary": None,
+            "changes_summary": None,
+            "next_message": None,
+            "is_question": False,
             "complete": False,
-            "needs_answer": False,
-            "question_generated": False,
-            "wrapup_message": None,
             "trace": [],
         }
 
@@ -160,18 +176,16 @@ async def run_chat_turn(
                     break
                 if mode == "custom":
                     # Two distinct custom-stream producers share this mode:
-                    # generate_answer_node's token-by-token streaming
-                    # (chunk["type"] == "answer_token") and
-                    # execution.execute()'s per-task progress events
-                    # (chunk["type"] == "operation_progress") — see
-                    # app/execution.py's _progress_event.
+                    # app.pipeline._run_direct_answer's token-by-token
+                    # streaming (chunk["type"] == "answer_token") and
+                    # app.pipeline.run_pipeline's per-stage progress events
+                    # (chunk["type"] == "operation_progress").
                     if chunk.get("type") == "answer_token":
                         yield {"type": "token", "content": chunk["token"]}
                     elif chunk.get("type") == "operation_progress":
                         yield {
                             "type": "operation_progress",
-                            "task_type": chunk["task_type"],
-                            "target": chunk["target"],
+                            "stage": chunk["stage"],
                             "ok": chunk["ok"],
                         }
                 elif mode == "updates":
@@ -200,7 +214,13 @@ async def run_chat_turn(
             yield {"type": "error", "message": graph_error or "graph did not produce a result"}
             return
 
-        session.messages.append(Message(role="user", content=message))
+        # An operation_answers resume sends message="" (see ChatRequest's
+        # docstring — the reply travels structurally, not as message text),
+        # so fall back to the chosen value(s) for the persisted transcript;
+        # otherwise a reload/loadSession shows a blank user bubble where the
+        # picked option should read (e.g. "Kitchen").
+        user_message_content = message or (", ".join(operation_answers.values()) if operation_answers else message)
+        session.messages.append(Message(role="user", content=user_message_content))
         if final_state["answer"]:
             session.messages.append(Message(role="assistant", content=final_state["answer"]))
 
@@ -208,63 +228,60 @@ async def run_chat_turn(
         session.current_field = final_state.get("current_field", session.current_field)
         session.active_room_id = final_state.get("active_room_id", session.active_room_id)
         session.trace.extend(final_state["trace"])
-        # validate_completeness_node's verdict, computed earlier in this same
-        # turn — equivalent to recomputing find_knowledge_gap() now (no node
-        # downstream of it mutates project state), just without redoing the work.
+        # app.pipeline.run_pipeline's own verdict (question_engine.
+        # find_knowledge_gaps returned None) — nothing downstream mutates
+        # project state, so no need to recompute it here.
         session.status = "complete" if final_state.get("complete") else "in_progress"
 
-        # Confirm what was captured before moving on to the next question, so
-        # an update_context turn doesn't just silently jump to a new question
-        # with no acknowledgment of what the user just said.
-        update_summary = final_state.get("update_summary")
-        if update_summary:
-            session.messages.append(Message(role="assistant", content=update_summary))
-            yield {"type": "context_updated", "message": update_summary}
+        # The pipeline's single join-step reply — replaces the old separate
+        # context_updated/ask_question/wrapup events. next_message is either
+        # the next question (is_question=true) or a closing/completion line
+        # (is_question=false); either way it's the one thing to show the
+        # user beyond a DIRECT_ANSWER's own streamed answer.
+        next_message = final_state.get("next_message")
+        is_question = final_state.get("is_question", False)
+        if next_message:
+            session.messages.append(Message(role="assistant", content=next_message))
+            yield {
+                "type": "pipeline_result",
+                "database_summary": final_state.get("database_summary"),
+                "context_summary": final_state.get("context_summary"),
+                "changes_summary": final_state.get("changes_summary"),
+                "message": next_message,
+                "is_question": is_question,
+            }
 
-        # The "type 2" closing statement (see generate_wrapup_message) — set
-        # exactly when complete_project_node ran this turn, mutually
-
-        wrapup_message = final_state.get("wrapup_message")
-        if wrapup_message:
-            session.messages.append(Message(role="assistant", content=wrapup_message))
-            yield {"type": "wrapup", "message": wrapup_message}
-
-        # A critical-tier value change held back by build_context_node, an
-        # unresolved-connection batch held back by classify_intent_node, or
-        # an ordinary knowledge-gap question — mutually exclusive by
-        # construction (only one node ever produces this turn's trailing
-        # ask, see question_generated), checked in this order only because
-        # the if/elif chain needs SOME order.
-   
+        # A held-back unresolved-connection batch (classify_intent_node) and
+        # an ordinary knowledge-gap question (run_pipeline) are mutually
+        # exclusive by construction — pending_operation_questions only ever
+        # comes from the short-circuit branch that never reaches
+        # run_pipeline, so next_message is always empty on that branch.
         pending_operation_questions = final_state.get("pending_operation_questions")
-        pending_question = final_state.get("pending_question")
-
-   
         if pending_operation_questions and session.status == "in_progress":
             for q in pending_operation_questions["questions"]:
                 session.messages.append(Message(role="assistant", content=q["question"]))
             session.pending_operation_questions = pending_operation_questions
             session.pending_gap = None
             yield {"type": "operation_questions", "questions": pending_operation_questions["questions"]}
-        if pending_question and session.status == "in_progress":
-            session.messages.append(Message(role="assistant", content=pending_question))
+        elif is_question and session.status == "in_progress":
             session.pending_gap = final_state.get("pending_gap")
             session.pending_operation_questions = None
-            yield {"type": "ask_question", "question": pending_question}
         else:
             session.pending_gap = None
             session.pending_operation_questions = None
 
         await save_session(session)
 
-        root_span.update(output=final_state.get("answer") or pending_question or wrapup_message or "")
+        root_span.update(output=final_state.get("answer") or next_message or "")
         yield {"type": "done", "session_id": session.session_id, "status": session.status}
 
 
 @router.post("/chat")
 async def chat(req: ChatRequest):
     async def event_stream():
-        async for event in run_chat_turn(req.session_id, req.message, req.image_url, req.operation_answers):
+        async for event in run_chat_turn(
+            req.session_id, req.message, req.image_url, req.operation_answers, req.operation_room_selections
+        ):
             if event["type"] == "heartbeat":
                 yield ": keep-alive\n\n"
                 continue

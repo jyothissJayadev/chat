@@ -47,7 +47,8 @@ Materials:
     flooring, countertop, wall finish, paint, or similar — where both the
     item and the material/finish chosen for it matter.
   instantiable: true  # one instance per item — RoomContext.materials[i].item today
-  fields: [Label, Material, Specification]  # Label = the item's own name (e.g. "flooring"); see PHASE5_CANONICAL_MAPPER.md
+  fields: [Label, Material, Specification, Quantity]  # Label = the item's own name (e.g. "flooring"); see PHASE5_CANONICAL_MAPPER.md
+  children: [Parts, Properties]
 
 Furniture:
   description: >
@@ -55,7 +56,8 @@ Furniture:
     sofa, table, unit, or similar standalone item the client selects or
     wants for the space.
   instantiable: true  # freeform ContextGraph nodes of type "entity" land here — see PHASE3_ONTOLOGY.md
-  fields: [Label, Material, Notes]
+  fields: [Label, Material, Quantity, Notes]
+  children: [Parts, Properties]
 
 Attributes:
   description: >
@@ -65,6 +67,38 @@ Attributes:
     constraint, or preference.
   instantiable: true  # catch-all for freeform ContextGraph nodes of type "attribute" not yet re-homed to a more specific subtree
   fields: [Label]
+  children: [Properties]
+
+# Composite-entity support: a physical sub-component of a freeform item
+# (Furniture/Materials) the user attaches to a parent entity — e.g. a sofa's
+# cover, a bed's bedcover, a set of pillows on top of something. One level
+# only: a part's own sub-components are captured as Property/Quantity on the
+# part, never as nested Parts (enforced structurally — Parts has no `Parts`
+# child). Additive-only addition to v1; existing paths are untouched.
+Parts:
+  description: >
+    A physical sub-component attached to a parent Furniture or Materials
+    instance — a cover, cushion, pillow set, or similar part-of relation.
+    Always nested one level under its parent instance; sub-parts of a part
+    are expressed as Properties/Quantity on the part itself, never as
+    further Parts nesting.
+  instantiable: true
+  fields: [Label, Material, Quantity, Notes]
+  children: [Properties]
+
+# A named key/value attribute of an item or part — color, finish, fabric, or
+# any other ad-hoc property. Generic by design: the property NAME is the
+# instance slug, the VALUE lives in the Value leaf. Additive-only; lets the
+# resolver express "red sofa" / "velvet cover" without a per-attribute field.
+Properties:
+  description: >
+    A named key/value attribute of a freeform item or its parts — color,
+    finish, fabric, or any descriptive property. The property name is the
+    instance slug; the value lives in the Value leaf. Terminal: never has
+    children of its own.
+  instantiable: true
+  fields: [Label, Value]
+  children: []
 
 Requirements:
   description: Non-room-specific requirements and preferences for the project overall.

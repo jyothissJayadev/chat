@@ -350,16 +350,136 @@ def test_room_id_from_connection(connection, expected_room_id):
 
 
 def test_split_connection_grounded_room_path_yields_room_id_override_only():
-    room_id, room_hint = canonical_mapper.split_connection("Rooms.a1b2c3d4.Furniture.island")
+    room_id, room_hint, parent_instance_path = canonical_mapper.split_connection("Rooms.a1b2c3d4.Furniture.island")
     assert room_id == "a1b2c3d4"
     assert room_hint is None
+    # A connection deeper than Rooms.<id> surfaces the parent instance path
+    # (full canonical form, with "Project." prefix) so composite-entity parts
+    # can attach under it — see app.pipeline._apply_update.
+    assert parent_instance_path == "Project.Rooms.a1b2c3d4.Furniture.island"
+
+
+def test_split_connection_grounded_room_only_yields_no_parent_instance():
+    room_id, room_hint, parent_instance_path = canonical_mapper.split_connection("Rooms.a1b2c3d4")
+    assert room_id == "a1b2c3d4"
+    assert room_hint is None
+    assert parent_instance_path is None
 
 
 def test_split_connection_free_text_yields_room_hint_override_only():
-    room_id, room_hint = canonical_mapper.split_connection("Living Room")
+    room_id, room_hint, parent_instance_path = canonical_mapper.split_connection("Living Room")
     assert room_id is None
     assert room_hint == "Living Room"
+    assert parent_instance_path is None
 
 
 def test_split_connection_none_yields_no_overrides():
-    assert canonical_mapper.split_connection(None) == (None, None)
+    assert canonical_mapper.split_connection(None) == (None, None, None)
+
+
+def test_split_connection_project_yields_no_overrides():
+    assert canonical_mapper.split_connection("Project") == (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Composite entities — map_part_to_canonical / map_property_to_canonical
+# (Parts/Properties nested under a freeform instance). Parts/Properties are
+# NOT in _FREEFORM_NODE_TYPES and never go through top-level type inference;
+# they only attach to an already-resolved parent instance. The fake_embed
+# scheme isn't needed for the no-candidate creation path (no embedding call
+# when there are zero existing siblings), but is patched in anyway so an
+# alias-embedding reuse path stays exercisable if a sibling already exists.
+# ---------------------------------------------------------------------------
+
+
+async def _make_parent_sofa(project_id: str, room_id: str) -> str:
+    """Create a parent Furniture instance the way the live pipeline would
+    (via map_to_canonical) and return its full canonical path, ready to pass
+    as parent_instance_path to the part/property mappers."""
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        parent = await map_to_canonical("sofa", None, project_id, room_id=room_id)
+    return parent.canonical_path
+
+
+async def test_map_part_creates_parts_instance_nested_under_parent():
+    project_id = "proj-part-create"
+    parent_path = await _make_parent_sofa(project_id, ROOM_ID)
+
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        match = await canonical_mapper.map_part_to_canonical("velvet cover", parent_path, project_id, ROOM_ID)
+
+    assert match.created_new is True
+    assert match.node_type == "Parts"
+    assert match.canonical_path == f"{parent_path}.Parts.velvet_cover"
+    # The part's own Label leaf was written by _create_instance.
+    label = await graph_store.find_one(project_id, f"{match.canonical_path}.Label")
+    assert label is not None and label.value == "velvet cover"
+
+
+async def test_map_part_reuses_existing_sibling_on_exact_alias():
+    project_id = "proj-part-reuse"
+    parent_path = await _make_parent_sofa(project_id, ROOM_ID)
+
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        first = await canonical_mapper.map_part_to_canonical("bedcover", parent_path, project_id, ROOM_ID)
+        second = await canonical_mapper.map_part_to_canonical("bedcover", parent_path, project_id, ROOM_ID)
+
+    assert second.created_new is False
+    assert second.matched_via == "alias_exact"
+    assert second.node_id == first.node_id
+
+
+async def test_map_part_does_not_reuse_a_sibling_under_a_different_parent():
+    """A cover on sofa A must never resolve to sofa B's cover — the
+    candidate pool is scoped to the named parent's subtree only."""
+    project_id = "proj-part-scoping"
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        sofa_a = await map_to_canonical("sofa", None, project_id, room_id=ROOM_ID)
+        sofa_b = await map_to_canonical("wardrobe", None, project_id, room_id=ROOM_ID)
+        cover_on_a = await canonical_mapper.map_part_to_canonical("cover", sofa_a.canonical_path, project_id, ROOM_ID)
+
+    # A second "cover" under sofa B must create a NEW part, not reuse sofa A's.
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        cover_on_b = await canonical_mapper.map_part_to_canonical("cover", sofa_b.canonical_path, project_id, ROOM_ID)
+
+    assert cover_on_b.created_new is True
+    assert cover_on_b.node_id != cover_on_a.node_id
+    assert cover_on_b.canonical_path.startswith(sofa_b.canonical_path)
+    assert cover_on_a.canonical_path.startswith(sofa_a.canonical_path)
+
+
+async def test_map_property_creates_properties_instance_with_label():
+    project_id = "proj-property-create"
+    parent_path = await _make_parent_sofa(project_id, ROOM_ID)
+
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        match = await canonical_mapper.map_property_to_canonical("color", "red", parent_path, project_id, ROOM_ID)
+
+    assert match.created_new is True
+    assert match.node_type == "Properties"
+    assert match.canonical_path == f"{parent_path}.Properties.color"
+    label = await graph_store.find_one(project_id, f"{match.canonical_path}.Label")
+    assert label is not None and label.value == "color"
+
+
+async def test_part_preview_commit_false_creates_nothing():
+    project_id = "proj-part-preview"
+    parent_path = await _make_parent_sofa(project_id, ROOM_ID)
+
+    with patch("app.canonical_mapper.llm.embed", side_effect=fake_embed):
+        preview = await canonical_mapper.map_part_to_canonical("pillows", parent_path, project_id, ROOM_ID, commit=False)
+
+    assert preview.created_new is True
+    assert preview.node_id == ""
+    assert preview.canonical_path == f"{parent_path}.Parts.pillows"
+    nodes = await graph_store.find_nodes(project_id)
+    # ensure_path scaffolds the Parts container on preview (same as the
+    # room-level container the existing preview test tolerates) — what must
+    # NOT exist is the part INSTANCE itself (a Parts node whose last path
+    # segment is the slug, not "Parts") or its Label leaf.
+    def _is_container(n):
+        return n.canonical_path.rsplit(".", 1)[-1] == n.node_type
+    assert not any(
+        n.node_type == "Parts" and not _is_container(n) for n in nodes
+    ), "commit=False must not create the part instance (only the container is scaffolded)"
+    assert not any(n.node_type == "Label" and n.canonical_path.startswith(f"{parent_path}.Parts.") for n in nodes)

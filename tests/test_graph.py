@@ -523,6 +523,62 @@ async def test_classify_intent_node_reasks_only_still_unresolved_ops_after_a_par
     assert {t["op_id"]: t["connection"] for t in pending["tasks"]} == {"op_1": "Rooms.r1", "op_2": None}
 
 
+async def test_classify_intent_node_fans_a_bundled_multi_room_answer_into_one_task_per_room():
+    """A bundled option (app.llm.RoomResolutionOption.room_ids) answers ONE
+    op_id but names 2+ existing rooms — the resume branch must turn that one
+    pending task into one task per room, each independently grounded, rather
+    than setting a single connection (see _apply_operation_answers)."""
+    pending_tasks = [
+        TaskSpec(type=TaskType.EDIT_CONTEXT, op_id="op_1", target="add laminate to the wardrobe", connection=None).model_dump(),
+    ]
+    state = base_state("whatever")
+    state["pending_operation_questions"] = {
+        "tasks": pending_tasks,
+        "questions": [{"op_id": "op_1", "text": "add laminate to the wardrobe", "question": "Which wardrobe?", "options": []}],
+    }
+    state["operation_answers"] = {"op_1": "Both Bedroom 1 and Bedroom 2"}
+    state["operation_room_selections"] = {"op_1": ["r1", "r2"]}
+
+    with patch("app.llm.classify_operations", side_effect=AssertionError):
+        result = await classify_intent_node(state)
+
+    assert result["pending_operation_questions"] is None
+    assert [t.op_id for t in result["tasks"]] == ["op_1__r1", "op_1__r2"]
+    assert [t.connection for t in result["tasks"]] == ["Rooms.r1", "Rooms.r2"]
+    assert all(t.target == "add laminate to the wardrobe" for t in result["tasks"])
+
+
+async def test_classify_intent_node_leaves_non_bundled_answers_alone_in_the_same_resume():
+    """A resume batch can mix an ordinary single-room answer with a bundled
+    one — only the op_id present in operation_room_selections fans out; the
+    other keeps its normal single-connection behavior."""
+    pending_tasks = [
+        TaskSpec(type=TaskType.EDIT_CONTEXT, op_id="op_1", target="change the countertop to granite", connection=None).model_dump(),
+        TaskSpec(type=TaskType.EDIT_CONTEXT, op_id="op_2", target="add laminate to the wardrobe", connection=None).model_dump(),
+    ]
+    state = base_state("whatever")
+    state["pending_operation_questions"] = {
+        "tasks": pending_tasks,
+        "questions": [
+            {"op_id": "op_1", "text": "change the countertop to granite", "question": "Which room?", "options": []},
+            {"op_id": "op_2", "text": "add laminate to the wardrobe", "question": "Which wardrobe?", "options": []},
+        ],
+    }
+    state["operation_answers"] = {"op_1": "Rooms.r1.Materials.countertop", "op_2": "Both Bedroom 1 and Bedroom 2"}
+    state["operation_room_selections"] = {"op_2": ["r1", "r2"]}
+
+    with patch("app.llm.classify_operations", side_effect=AssertionError):
+        result = await classify_intent_node(state)
+
+    assert result["pending_operation_questions"] is None
+    op_ids = [t.op_id for t in result["tasks"]]
+    assert op_ids == ["op_1", "op_2__r1", "op_2__r2"]
+    connections = {t.op_id: t.connection for t in result["tasks"]}
+    assert connections["op_1"] == "Rooms.r1.Materials.countertop"
+    assert connections["op_2__r1"] == "Rooms.r1"
+    assert connections["op_2__r2"] == "Rooms.r2"
+
+
 # ---------------------------------------------------------------------------
 # Split-intent concurrency
 # ---------------------------------------------------------------------------

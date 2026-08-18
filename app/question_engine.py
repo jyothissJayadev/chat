@@ -1,46 +1,35 @@
-"""Knowledge-Gap Question Generation — Phase 15. Replaces
-PartialContext.next_field_to_ask()'s fixed PROJECT_FIELDS/ROOM_FIELDS
-priority chain with a walk over ontology/v1.yaml itself — any
-ontology-defined field with no confirmed KnowledgeNode value gets asked
-about, full stop, with no separately-maintained field list that can fall
-out of sync with the ontology (the actual fix for the "timeline needed its
-own end-of-function special case" bug class the plan describes — that bug
-was really "the walked list and the ontology can diverge," and there's now
-only one list: the ontology itself). This now also covers the room field
-list itself (_ROOM_FIELD_NODE_TYPES, read from ontology/v1.yaml's
-Rooms.fields) — it used to be a hand-maintained mirror of that list.
+"""Knowledge-Gap Detection — Phase 15 (rebuilt for the single-pipeline
+architecture, see the classifier-redesign/pipeline plan). Walks
+ontology/v1.yaml itself to find any ontology-defined field with no
+confirmed KnowledgeNode value — no separately-maintained field list that can
+fall out of sync with the ontology. This also covers the room field list
+itself (_ROOM_FIELD_NODE_TYPES, read from ontology/v1.yaml's Rooms.fields).
 
 Scope: ports next_field_to_ask()'s job for the STRUCTURED fields
 (BasicInformation, Budget, Timeline, and each room's RoomType/Budget/Style/
-SquareFootage/ExistingFurniture). The plan's fuller
-find_knowledge_gap(project_id, current_task) — walking exactly what a
-specific task like QUOTE_GENERATION needs — isn't buildable yet:
-QUOTE_GENERATION was never added to app.tasks.TaskType (see that module's
-docstring — SAVE_CONTEXT/DELETE_CONTEXT/MEMORY/QUOTE_GENERATION are all
-deliberately unbuilt, nothing implements them, so there's no per-task
-dependency subtree to walk). This module answers "what's still missing for
-this PROJECT overall" — a real, useful subset of Phase 15's goal.
+SquareFootage/ExistingFurniture).
 
-moreRoomsPending is deliberately not walked here — Phase 3 already decided
-it's a dialogue-mechanic flag, not a KnowledgeNode fact (out of ontology
-entirely — ontology/PHASE3_ONTOLOGY.md). Not asking about it isn't a new
-gap, it's that same decision holding.
+moreRoomsPending is deliberately not walked here — it's a dialogue-mechanic
+flag, not a KnowledgeNode fact (out of ontology entirely).
 
-Retry-budget tiering (rephrase-then-infer on decline) has been removed —
-decline is now a whole-room skip (app.graph.classify_intent_node), not a
-per-field retry count, so KnowledgeGap no longer carries a tier and this
-module no longer needs FIELD_TIERS.
+Retry-budget tiering (rephrase-then-infer on decline) does not exist here —
+decline is a whole-room skip (app.graph.classify_intent_node), not a
+per-field retry count, so KnowledgeGap carries no tier and this module
+doesn't need FIELD_TIERS (that's a separate, unrelated concept used by
+app.context_builder.detect_conflicts for critical-tier overwrite conflicts).
 
 find_knowledge_gaps() returns a KnowledgeGapBatch — every open field for one
-room at once, not one field per turn — see app.graph.generate_question_node,
-which is what actually wires this into the live turn (this module itself
-stays DB-adjacent but pure of any graph-node routing decisions)."""
+room at once, not one field per turn. Unlike the pre-cutover version of this
+module, there is no generate_question() LLM call here anymore — the
+pipeline's final turn-summary call (app.llm.generate_turn_summary) phrases
+the next question itself from a batch's gaps, so a separate LLM round trip
+per question is no longer needed."""
 
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from app import llm, graph_store
+from app import graph_store
 from app.canonical_mapper import _ONTOLOGY
 from app.context_builder import LEAF_TO_FIELD_NAME
 from app.models import FIELD_LABELS
@@ -53,8 +42,9 @@ from app.models import FIELD_LABELS
 # labels/confirmation summaries — one source of truth, not a second copy.
 _ROOM_FIELD_NODE_TYPES: list[str] = _ONTOLOGY["Rooms"]["fields"]
 
-# Sentinel path for "no room exists yet" — mirrors PartialContext.next_field_to_ask()'s
-# own "room:new.roomType" sentinel key. Not a real KnowledgeNode path.
+# Sentinel path for "no room exists yet" — mirrors the pre-cutover
+# PartialContext.next_field_to_ask()'s own "room:new.roomType" sentinel key.
+# Not a real KnowledgeNode path.
 _NEW_ROOM_PATH = "Project.Rooms.<new>"
 
 
@@ -66,11 +56,11 @@ class KnowledgeGap(BaseModel):
 
 
 class KnowledgeGapBatch(BaseModel):
-    """What generate_question_node actually asks about on a given turn — one
-    or more KnowledgeGaps to fold into a single combined question. `room_id`
-    is set whenever this batch is every open room field for one room (see
-    find_knowledge_gaps); it's None for the project-level blocking gaps
-    (ProjectType, room existence, Timeline, Budget.Total), which stay
+    """What the pipeline's turn-summary call asks about on a given turn —
+    one or more KnowledgeGaps folded into a single combined question.
+    `room_id` is set whenever this batch is every open room field for one
+    room (see find_knowledge_gaps); it's None for the project-level blocking
+    gaps (ProjectType, room existence, Timeline, Budget.Total), which stay
     single-item batches — batching those isn't the "one field at a time per
     room" problem this exists to fix."""
 
@@ -85,11 +75,8 @@ async def find_knowledge_gaps(
     instead of one field at a time. Room fields are the actual fix here: all
     of a room's open fields (per _ROOM_FIELD_NODE_TYPES) come back together
     as one KnowledgeGapBatch instead of forcing a separate turn per field —
-    see app.graph.generate_question_node, which folds a batch's gaps into one
-    combined question. The three project-level blocking gaps (ProjectType,
-    room existence, and the Timeline/Budget.Total pair at the very end) stay
-    single-item batches; they aren't the "one field at a time per room"
-    problem this exists to fix.
+    see app.pipeline.run_pipeline, which folds a batch's gaps into one
+    combined question via the turn-summary call.
 
     `active_room_id` is which room's batch to prefer (see
     app.graph.classify_intent_node's connection-derived tracking) — it stays
@@ -99,20 +86,20 @@ async def find_knowledge_gaps(
     the caller is expected to persist whatever room_id comes back as the new
     active_room_id, since this function is also what decides when focus
     shifts forward."""
-    # lifecycle == "active" filter: a retracted node (app.graph.delete_context_node)
-    # must count as "open" again, not "known" — excluding it here (rather than
-    # special-casing every lookup below) covers both _is_open AND the room_ids
-    # comprehension in one place, so a retracted room's own container node
-    # can't keep the room "known" once its RoomType leaf is gone too.
+    # lifecycle == "active" filter: a retracted node (app.pipeline's
+    # deletion handling) must count as "open" again, not "known" — excluding
+    # it here (rather than special-casing every lookup below) covers both
+    # _is_open AND the room_ids comprehension in one place, so a retracted
+    # room's own container node can't keep the room "known" once its
+    # RoomType leaf is gone too.
     nodes = await graph_store.find_nodes(project_id, lifecycle="active")
     by_path = {n.canonical_path: n for n in nodes}
     skipped = set(skipped_rooms or [])
 
     def _is_open(path: str) -> bool:
         node = by_path.get(path)
-        # Nothing in this pipeline sets status="skipped" yet (that's the
-        # retry-exhaustion mechanic DialogueState/Phase 7's still-deferred
-        # cutover owns) — a missing value is the only "open" signal today.
+        # Nothing in this pipeline sets status="skipped" — a missing value
+        # is the only "open" signal.
         return node is None or node.value is None
 
     if _is_open("Project.BasicInformation.ProjectType"):
@@ -199,12 +186,3 @@ async def find_knowledge_gaps(
         )
 
     return None
-
-
-async def generate_question(
-    gaps: list[KnowledgeGap], context: dict, *, is_retry: bool = False, capture: dict | None = None
-) -> str:
-    """Thin adapter onto the existing llm.generate_question call — same
-    model, just fed every gap in the batch's field_label at once so the LLM
-    phrases one combined question instead of one call per field."""
-    return await llm.generate_question([g.field_label for g in gaps], context, is_retry=is_retry, capture=capture)

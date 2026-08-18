@@ -81,6 +81,8 @@ def _operations_to_tasks(operations: list["llm.Operation"]) -> list[TaskSpec]:
             op_id=op.id,
             target=op.text,
             connection=op.connection,
+            confusion=op.confusion,
+            confusion_note=op.confusion_note,
         )
         for op in operations
     ]

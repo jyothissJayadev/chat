@@ -1,7 +1,5 @@
-from unittest.mock import patch
-
 from app.context_builder import ProposedWrite, apply_to_graph
-from app.question_engine import find_knowledge_gaps, generate_question
+from app.question_engine import find_knowledge_gaps
 
 # Walk order (see PENDING_GAP_ANALYSIS.md / the pending_gap-centralization
 # plan, updated for batched room questions): ProjectType -> Rooms existence
@@ -190,20 +188,3 @@ async def test_find_knowledge_gaps_revisits_a_skipped_room_only_after_every_othe
         "becomes the only candidate left in the second pass"
     )
     assert [g.node_type for g in batch2.gaps] == ["Style", "SquareFootage", "ExistingFurniture"]
-
-
-async def test_generate_question_passes_every_batched_field_label_to_llm():
-    captured = {}
-
-    async def fake_generate_question(field_names, context, *, is_retry=False, capture=None):
-        captured["field_names"] = field_names
-        captured["is_retry"] = is_retry
-        return "What's the budget, style, and square footage for the kitchen?"
-
-    batch = await find_knowledge_gaps("proj-gap-question-text")
-    with patch("app.llm.generate_question", side_effect=fake_generate_question):
-        question = await generate_question(batch.gaps, {}, is_retry=True)
-
-    assert question == "What's the budget, style, and square footage for the kitchen?"
-    assert captured["field_names"] == ["project type"]
-    assert captured["is_retry"] is True

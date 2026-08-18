@@ -84,6 +84,18 @@ def slugify(text: str) -> str:
     return slug or "item"
 
 
+def legal_fields(node_type: str) -> list[str]:
+    """The leaf field names ontology/v1.yaml actually allows under
+    `node_type` (e.g. "Materials" -> ["Label", "Material", "Specification"])
+    — empty for a node_type with no `fields` entry (a pure container type
+    like "Rooms" or "Requirements"). Public: used by
+    app.llm._validate_context_changes to check that a freeform entity edit's
+    claimed field is legal for the entity's own node_type, the same
+    already-loaded _ONTOLOGY this module uses everywhere else for
+    type-inference/container-path decisions."""
+    return _ONTOLOGY.get(node_type, {}).get("fields", [])
+
+
 class CanonicalMatch(BaseModel):
     canonical_path: str
     node_type: str
@@ -136,22 +148,43 @@ def room_id_from_connection(connection: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def split_connection(connection: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """(room_id_override, room_hint_override) derived from a classifier
-    connection — shared by app.execution._resolve_write_task (EDIT_CONTEXT)
-    and app.graph's delete-target resolution (DELETE_CONTEXT). A grounded
-    connection's room segment, if any, becomes an exact room_id override; an
-    ungrounded (free-text new-room/new-entity name) connection becomes a
-    room_hint override — generalizing app.tasks.TaskSpec.room_hint's old
-    regex-detected-vocabulary source to the classifier's own
-    project-grounded guess. connection is always an anchor hint feeding the
-    existing resolve pipeline, never a final write path — see
+def split_connection(connection: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """(room_id_override, room_hint_override, parent_instance_path) derived
+    from a classifier connection — shared by app.pipeline._run_first_action
+    (EDIT_CONTEXT) and app.graph's delete-target resolution (DELETE_CONTEXT).
+    A grounded connection's room segment, if any, becomes an exact room_id
+    override; an ungrounded (free-text new-room/new-entity name) connection
+    becomes a room_hint override — generalizing app.tasks.TaskSpec.room_hint's
+    old regex-detected-vocabulary source to the classifier's own
+    project-grounded guess.
+
+    `parent_instance_path` is the root-relative canonical path of an existing
+    freeform instance the operation attaches to, when `connection` points
+    DEEPER than `Rooms.<id>` (e.g. "Rooms.c785b3b6.Furniture.beds" — the bed
+    a bedcover is being added TO). None when the connection is room-level or
+    shallower, since there is no parent instance to attach parts to in that
+    case. Threaded into canonical_mapper.map_part_to_canonical /
+    map_property_to_canonical by app.pipeline._apply_update so a composite
+    entity mention (bedcover, sofa cover, pillows) lands as a child of the
+    named parent instance rather than as a sibling under the room's
+    Furniture/Materials container. connection is always an anchor hint
+    feeding the existing resolve pipeline, never a final write path — see
     is_grounded_connection's docstring and the classifier-connection plan."""
     if not connection:
-        return None, None
+        return None, None, None
     if is_grounded_connection(connection):
-        return room_id_from_connection(connection), None
-    return None, connection
+        room_id = room_id_from_connection(connection)
+        # Deeper than "Rooms.<id>" => the tail beyond the room id is an
+        # existing instance path the operation targets (e.g. "Furniture.beds").
+        # Reconstruct the root-relative parent instance path; only set when
+        # there genuinely is a tail (a bare "Rooms.<id>" connection has none).
+        tail = connection.split(".", 2)[2] if connection.count(".") >= 2 else ""
+        # connection is root-relative (no "Project." prefix, per the prompt
+        # convention); graph_store canonical_paths carry the prefix, so prepend
+        # it here to give callers a path usable directly with graph_store.
+        parent_instance_path = f"Project.{connection}" if tail else None
+        return room_id, None, parent_instance_path
+    return None, connection, None
 
 
 def _container_path(node_type: str, room_id: Optional[str]) -> Optional[str]:
@@ -305,7 +338,7 @@ async def ensure_path(canonical_path: str, project_id: str) -> KnowledgeNode:
 
 
 async def _resolve_instance_path(
-    raw_entity: str, node_type: str, project_id: str, room_id: Optional[str]
+    raw_entity: str, container_path: str, project_id: str
 ) -> tuple[str, KnowledgeNode]:
     """The collision-safe path a new freeform instance for raw_entity would
     live at, plus its (get-or-created) ancestor container — read-mostly:
@@ -313,8 +346,14 @@ async def _resolve_instance_path(
     Project.Rooms.<id>.Materials, no `value` of its own), never the instance
     or Label leaf itself. Shared by _create_instance (which then writes
     those leaves) and map_to_canonical's commit=False resolve path, so a
-    previewed path and what actually gets created later can never disagree."""
-    container_path = _container_path(node_type, room_id)
+    previewed path and what actually gets created later can never disagree.
+
+    Takes the container_path explicitly (rather than deriving it from
+    node_type+room_id via _container_path) so the same code path serves both
+    room-scoped freeform instances (Materials/Furniture/...) AND nested
+    composite children (Parts under a parent Furniture instance, Properties
+    under any instance) whose container is the parent instance path + the
+    child container segment, not a function of node_type alone."""
     container = await ensure_path(container_path, project_id)
 
     slug = slugify(raw_entity)
@@ -334,8 +373,19 @@ async def _create_instance(
     room_id: Optional[str],
     confidence: float,
     embedding: Optional[list[float]],
+    *,
+    container_path: Optional[str] = None,
 ) -> KnowledgeNode:
-    instance_path, container = await _resolve_instance_path(raw_entity, node_type, project_id, room_id)
+    """Creates a freeform instance + its Label leaf. `container_path`
+    defaults to the room-scoped container derived from node_type+room_id
+    (the original Materials/Furniture/... case); pass it explicitly to
+    create a composite child (Parts/Properties) under a parent instance
+    path instead — the only thing that differs is which container the
+    instance nests under, everything else (instance node, Label leaf,
+    version row) is identical."""
+    if container_path is None:
+        container_path = _container_path(node_type, room_id)
+    instance_path, container = await _resolve_instance_path(raw_entity, container_path, project_id)
 
     instance = KnowledgeNode(
         canonical_path=instance_path, node_type=node_type, parent_id=container.node_id,
@@ -449,7 +499,7 @@ async def map_to_canonical(
         final_type, final_matched_via, final_flagged = node_type, matched_via, False
 
     if not commit:
-        instance_path, _container = await _resolve_instance_path(raw_entity, final_type, project_id, room_id)
+        instance_path, _container = await _resolve_instance_path(raw_entity, _container_path(final_type, room_id), project_id)
         return CanonicalMatch(
             canonical_path=instance_path, node_type=final_type, node_id="",
             created_new=True, confidence=type_confidence, matched_via=final_matched_via, flagged_for_review=final_flagged,
@@ -462,72 +512,133 @@ async def map_to_canonical(
     )
 
 
-# Stricter than _MATCH_THRESHOLD (0.75, used for creation/dedup matching) —
-# creating a low-confidence node in Unmapped for later review is safe;
-# retracting the wrong node on a low-confidence guess is not. Asymmetric
-# risk, asymmetric threshold.
-_DELETION_MATCH_THRESHOLD = 0.85
-# Two candidates within this margin of each other (cosine similarity, 0-1
-# scale) are treated as tied — "which ceiling fan?" territory, not "pick the
-# best one and move on."
-_DELETION_AMBIGUITY_MARGIN = 0.05
+# ---------------------------------------------------------------------------
+# Composite-entity children: Parts and Properties nested under a freeform
+# instance (sofa -> cover/pillows, sofa -> color=red). These are NOT routed
+# through the top-level map_to_canonical classification — Parts/Properties
+# are deliberately NOT in _FREEFORM_NODE_TYPES, since they only ever attach
+# to an already-resolved parent instance (no room-level type inference, no
+# project-wide alias pool). Reuses the same alias-exact / embedding-dedup
+# machinery as map_to_canonical, just scoped to the parent's child container.
+# See the composite-entity plan (Parts/Properties ontology addition).
+# ---------------------------------------------------------------------------
 
 
-class DeletionCandidate(BaseModel):
-    instance: KnowledgeNode
-    # The freeform instance's own Label child's value (e.g. "ceiling fan") —
-    # the instance node itself never carries a `value` (see _create_instance),
-    # so this is what a caller should actually show the user, not
-    # instance.value.
-    label: str
+async def _child_candidates(
+    parent_instance_path: str, child_container_segment: str, project_id: str
+) -> list[tuple[KnowledgeNode, KnowledgeNode]]:
+    """(label_node, instance_node) pairs for every existing child instance
+    of `parent_instance_path` under the named container segment
+    ("Parts"/"Properties") — the candidate pool checked before a new part/
+    property is created, scoped to that one parent so a cover on sofa A
+    never reuses sofa B's cover. Reuses graph_store.find_label_instance_pairs
+    by filtering its full-project result to this parent's subtree, rather
+    than adding a new Cypher path-prefix variant — the per-parent child
+    count is tiny and a project's freeform-fact count is bounded (same
+    reasoning as _existing_candidates)."""
+    container_path = f"{parent_instance_path}.{child_container_segment}"
+    pairs = await graph_store.find_label_instance_pairs(project_id, None, child_container_segment)
+    return [
+        (label, instance)
+        for label, instance in pairs
+        if instance.canonical_path.startswith(f"{container_path}.")
+    ]
 
 
-class DeletionMatch(BaseModel):
-    outcome: Literal["single", "ambiguous", "none"]
-    match: Optional[DeletionCandidate] = None   # set only when outcome == "single"
-    candidates: list[DeletionCandidate] = []     # set only when outcome == "ambiguous"
-    confidence: float = 0.0
-
-
-async def resolve_deletion_target(
-    raw_entity: str, project_id: str, room_id: Optional[str] = None
-) -> DeletionMatch:
-    """The one entry point app.graph.delete_context_node uses to find what a
-    retraction request refers to among LIVE (lifecycle="active") freeform
-    facts. Deliberately separate from map_to_canonical: that function's job
-    is match-or-CREATE and its single-best-match return shape can't express
-    "two equally good candidates" — exactly the case deletion must not guess
-    through (see the "ambiguous room hint" edge case in the deletion-support
-    plan). Read-only: never records a new alias, never creates anything, even
-    as a side effect — embedding backfill for an EXISTING candidate (via
-    _score_candidates) is the only write this function can cause, same as
-    map_to_canonical's own normal matching already does."""
-    candidates = await _existing_candidates(project_id, room_id, None, active_only=True)
-    if not candidates:
-        return DeletionMatch(outcome="none")
+async def _map_child_to_canonical(
+    raw_entity: str,
+    child_container_segment: str,
+    parent_instance_path: str,
+    project_id: str,
+    room_id: Optional[str],
+    *,
+    commit: bool = True,
+) -> CanonicalMatch:
+    """Shared resolve+create body for both Parts (raw_entity = "bedcover")
+    and Properties (raw_entity = the property name, e.g. "color"). The only
+    thing that differs between the two is `child_container_segment`
+    ("Parts" vs "Properties") — the instance node_type is that segment, the
+    container is `{parent_instance_path}.{segment}`, and the same alias-
+    exact / embedding dedup against existing siblings runs before anything
+    new is created. `commit=False` previews the would-be path without
+    writing, same contract as map_to_canonical."""
+    container_path = f"{parent_instance_path}.{child_container_segment}"
+    candidates = await _child_candidates(parent_instance_path, child_container_segment, project_id)
 
     exact = _exact_alias_match(raw_entity, candidates)
     if exact is not None:
-        label, instance = exact
-        return DeletionMatch(
-            outcome="single", match=DeletionCandidate(instance=instance, label=str(label.value or "")), confidence=1.0
+        _label, instance = exact
+        return CanonicalMatch(
+            canonical_path=instance.canonical_path, node_type=instance.node_type, node_id=instance.node_id,
+            created_new=False, confidence=1.0, matched_via="alias_exact", flagged_for_review=False,
         )
 
-    query_vec = (await llm.embed([raw_entity]))[0]
-    scored = await _score_candidates(query_vec, candidates)
-    top_score = scored[0][1]
-    if top_score < _DELETION_MATCH_THRESHOLD:
-        return DeletionMatch(outcome="none", confidence=top_score)
+    query_vec: Optional[list[float]] = None
+    if candidates:
+        query_vec = (await llm.embed([raw_entity]))[0]
+        best_pair, best_score = await _best_embedding_match(query_vec, candidates)
+        if best_pair is not None and best_score >= _MATCH_THRESHOLD:
+            label, instance = best_pair
+            normalized = raw_entity.strip()
+            known = {str(label.value or "").strip().lower()} | {a.lower() for a in label.aliases}
+            if normalized.lower() not in known:
+                label.aliases.append(normalized)
+                await graph_store.save_node(label)
+            return CanonicalMatch(
+                canonical_path=instance.canonical_path, node_type=instance.node_type, node_id=instance.node_id,
+                created_new=False, confidence=best_score, matched_via="alias_embedding", flagged_for_review=False,
+            )
 
-    tied = [pair for pair, score in scored if score >= top_score - _DELETION_AMBIGUITY_MARGIN]
-    if len(tied) > 1:
-        return DeletionMatch(
-            outcome="ambiguous",
-            candidates=[DeletionCandidate(instance=instance, label=str(label.value or "")) for label, instance in tied],
-            confidence=top_score,
+    if not commit:
+        instance_path, _container = await _resolve_instance_path(raw_entity, container_path, project_id)
+        return CanonicalMatch(
+            canonical_path=instance_path, node_type=child_container_segment, node_id="",
+            created_new=True, confidence=1.0, matched_via="type_hint", flagged_for_review=False,
         )
 
-    label, instance = tied[0]
-    return DeletionMatch(
-        outcome="single", match=DeletionCandidate(instance=instance, label=str(label.value or "")), confidence=top_score
+    instance = await _create_instance(
+        raw_entity, child_container_segment, project_id, room_id, 1.0, query_vec,
+        container_path=container_path,
     )
+    return CanonicalMatch(
+        canonical_path=instance.canonical_path, node_type=child_container_segment, node_id=instance.node_id,
+        created_new=True, confidence=1.0, matched_via="type_hint", flagged_for_review=False,
+    )
+
+
+async def map_part_to_canonical(
+    raw_entity: str,
+    parent_instance_path: str,
+    project_id: str,
+    room_id: Optional[str] = None,
+    *,
+    commit: bool = True,
+) -> CanonicalMatch:
+    """Resolve a part mention ("bedcover", "velvet cover") to a canonical
+    Parts instance nested under `parent_instance_path` (e.g.
+    Project.Rooms.<id>.Furniture.beds.Parts.bedcover). Reuses an existing
+    sibling part on alias-exact/embedding match; otherwise creates a new
+    Parts instance + Label leaf. One level only — a part's own sub-parts are
+    never created here (the resolver folds them into the part's
+    Properties/Quantity per the composite-entity plan)."""
+    return await _map_child_to_canonical(raw_entity, "Parts", parent_instance_path, project_id, room_id, commit=commit)
+
+
+async def map_property_to_canonical(
+    name: str,
+    value: str,
+    parent_instance_path: str,
+    project_id: str,
+    room_id: Optional[str] = None,
+    *,
+    commit: bool = True,
+) -> CanonicalMatch:
+    """Resolve a named property ("color"="red") to a canonical Properties
+    instance nested under `parent_instance_path`, writing both its Label
+    (=name) and Value (=value) leaves. Reuses an existing sibling property of
+    the same name on alias-exact match (updating its Value); otherwise
+    creates a new Properties instance. `value` is written by the caller via
+    the standard ProposedWrite path — this function only resolves the
+    Properties instance + its Label, returning the canonical_path the Value
+    leaf should be written at (`{match.canonical_path}.Value`)."""
+    return await _map_child_to_canonical(name, "Properties", parent_instance_path, project_id, room_id, commit=commit)

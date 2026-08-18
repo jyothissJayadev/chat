@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from typing import Any, Literal, Optional
 from uuid import uuid4
 
@@ -66,48 +65,6 @@ FIELD_LABELS: dict[str, str] = {
 }
 
 FieldStatus = Literal["confirmed", "assumed", "skipped"]
-
-
-class ProjectMeta(BaseModel):
-    """Project-level fields — apply once per quotation, not per room."""
-
-    projectType: Optional[str] = None  # "new construction" | "renovation" | "refresh" | free text
-    overallBudget: Optional[str] = None
-    timeline: Optional[str] = None
-    # None = not yet asked whether more rooms are in scope; True/False once asked.
-    moreRoomsPending: Optional[bool] = None
-
-
-class RoomContext(BaseModel):
-    """One room/space within a project. A project can hold several of these."""
-
-    room_id: str = Field(default_factory=lambda: uuid4().hex[:8])
-    roomType: Optional[str] = None  # a suggested vocabulary term, or free text via "other"
-    budgetOrRequirement: Optional[str] = None  # a number OR a description satisfies this
-    style: Optional[str] = None
-    squareFootage: Optional[float] = None
-    existingFurniture: Optional[str] = None
-    materials: Optional[list[MaterialSpec]] = None
-
-
-# A one-character-off typo on a short room name ("bedrroom" vs "bedroom")
-# scores well above this; two genuinely different room types ("kitchen" vs
-# "bedroom") score well below it. Shared by app.context_builder._resolve_room
-# and app.canonical_mapper's room-scoping so every path agrees on what counts
-# as "the same room" — live-observed without this (in the pre-cutover
-# PartialContext.resolve_room this originally lived on): a later turn's
-# correctly-spelled respelling of an already-known room silently created a
-# duplicate room instead of updating the existing one.
-_ROOM_TYPE_FUZZY_MATCH_THRESHOLD = 0.82
-
-
-def room_type_matches(a: Optional[str], b: Optional[str]) -> bool:
-    if not a or not b:
-        return False
-    a, b = a.strip().lower(), b.strip().lower()
-    if a == b:
-        return True
-    return SequenceMatcher(None, a, b).ratio() >= _ROOM_TYPE_FUZZY_MATCH_THRESHOLD
 
 
 class ChatSession(Document):

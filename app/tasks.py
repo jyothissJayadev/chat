@@ -64,3 +64,12 @@ class TaskSpec(BaseModel):
     # into context_builder.resolve_context — never a final write path (see
     # app.canonical_mapper.is_grounded_connection/room_id_from_connection).
     connection: Optional[str] = None
+    # Mirrors app.llm.Operation.confusion/confusion_note — a genuine
+    # unresolved either/or CONTENT decision the user stated but didn't
+    # commit to (see app.prompts.CLASSIFY_OPERATIONS_SYSTEM_TEMPLATE's
+    # CONFUSION section). Independent of connection: a task can be
+    # ungrounded, content-undecided, both, or neither. app.graph's
+    # clarifying-question branch holds the turn for confusion=True the same
+    # way it does for connection=None.
+    confusion: bool = False
+    confusion_note: Optional[str] = None

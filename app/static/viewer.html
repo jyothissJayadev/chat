@@ -177,9 +177,9 @@
   .empty { color: #555; font-size: 13px; font-style: italic; }
   .msg.pending { opacity: 0.7; }
   /* Clarifying-question options (app.chat's operation_questions SSE event —
-     see app.graph._generate_operation_questions). For now this only renders
-     the LLM-provided fixed option buttons, no free-text input yet (that's
-     the "allow_custom" affordance the event also carries — a later pass). */
+     see app.graph._generate_operation_questions). Renders the LLM-provided
+     fixed option buttons; no free-text input (the "allow_custom" affordance
+     the event also carries) — deliberately deferred, buttons-only for now. */
   .op-options { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .op-option-btn {
     padding: 5px 10px;
@@ -193,6 +193,23 @@
   .op-option-btn:hover:not(:disabled) { background: #31405a; }
   .op-option-btn:disabled { opacity: 0.5; cursor: default; }
   .op-option-btn.chosen { background: #2b6cb0; border-color: #2b6cb0; color: #fff; }
+  /* A lone option is the Room Resolution Agent's confident pick (rule 15 —
+     see app.llm.RoomResolutionItem's docstring): style it as "recommended"
+     rather than one plain choice among several. Multiple options get no
+     ranking since the backend sends none — they render as equal choices. */
+  .op-option-btn.recommended { background: #1f5c3a; border-color: #2f8f5c; color: #d7ffe9; }
+  .op-option-btn.recommended:hover:not(:disabled) { background: #256e46; }
+  /* A bundled multi-room option (opt.room_ids set, 2+ rooms — see
+     app.llm.RoomResolutionOption's multi-room rule): dashed border marks it
+     as "applies to several rooms at once" rather than one specific room. */
+  .op-option-btn.bundle { border-style: dashed; }
+  /* One batch = one operation_questions SSE event's whole question list —
+     answered locally (picking/re-picking an option per question just
+     toggles .chosen, nothing sent) until the single submit button below
+     fires ONE combined operation_answers reply for the whole batch. */
+  .op-batch-progress { font-size: 12px; color: #999; margin: 8px 4px 4px; }
+  .op-batch-submit { margin: 4px; }
+  .op-batch-submit:disabled { opacity: 0.5; cursor: default; background: #333; }
   .graph-panel {
     display: flex;
     flex-direction: column;
@@ -278,7 +295,13 @@
         <h2>Knowledge Graph</h2>
         <div style="display:flex; gap:12px; align-items:center;">
           <div class="legend" id="graphLegend"></div>
-          <button id="resetLayoutBtn" class="secondary">Reset Layout</button>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <button id="zoomOutBtn" class="secondary" title="Zoom out">−</button>
+            <span id="zoomLabel" class="status" style="min-width:44px; text-align:center;">100%</span>
+            <button id="zoomInBtn" class="secondary" title="Zoom in">+</button>
+            <button id="resetZoomBtn" class="secondary" title="Reset zoom and pan">Fit</button>
+            <button id="resetLayoutBtn" class="secondary">Reset Layout</button>
+          </div>
         </div>
       </div>
       <canvas id="graphCanvas"></canvas>
@@ -481,7 +504,7 @@ function renderTraceEntry(t) {
     if (t.llm_input) {
       const details = document.createElement('details');
       details.className = 'trace-section';
-      details.open = true;
+      details.open = false;
       const summary = document.createElement('summary');
       summary.textContent = 'LLM Input';
       details.appendChild(summary);
@@ -505,7 +528,7 @@ function renderTraceEntry(t) {
     if (t.llm_output) {
       const details = document.createElement('details');
       details.className = 'trace-section';
-      details.open = true;
+      details.open = false;
       const summary = document.createElement('summary');
       summary.textContent = 'LLM Output';
       details.appendChild(summary);
@@ -600,6 +623,8 @@ const graphLayout = new Map(); // id -> {x, y, vx, vy, pinned}
 let graphNodes = [];
 let graphEdges = [];
 let draggingNodeId = null;
+let panning = false;
+let lastPan = null;
 let graphCanvas = null;
 let graphCtx = null;
 let resizeGraphCanvasFn = null;
@@ -617,11 +642,14 @@ function canvasPoint(e) {
 }
 
 function findNodeAt(x, y) {
+  const rect = graphCanvas.getBoundingClientRect();
+  const hitR = Math.max(8, 14 * graphScale * graphZoom);
   for (const n of graphNodes) {
     const p = graphLayout.get(n.id);
     if (!p) continue;
-    const dx = p.x - x, dy = p.y - y;
-    if (dx * dx + dy * dy <= 14 * 14) return n;
+    const s = layoutToScreen(rect, p.x, p.y);
+    const dx = s.x - x, dy = s.y - y;
+    if (dx * dx + dy * dy <= hitR * hitR) return n;
   }
   return null;
 }
@@ -641,19 +669,40 @@ function initGraphCanvas() {
   window.addEventListener('resize', resize);
   resizeGraphCanvasFn = resize;
 
+  graphCanvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = graphCanvas.getBoundingClientRect();
+    const pt = canvasPoint(e);
+    zoomAt(pt.x, pt.y, e.deltaY < 0 ? 1.15 : 1 / 1.15, rect);
+  }, { passive: false });
+
   graphCanvas.addEventListener('mousedown', (e) => {
     const { x, y } = canvasPoint(e);
     const hit = findNodeAt(x, y);
     if (hit) {
       draggingNodeId = hit.id;
       graphCanvas.style.cursor = 'grabbing';
+    } else {
+      panning = true;
+      lastPan = { x, y };
+      graphCanvas.style.cursor = 'move';
     }
   });
   graphCanvas.addEventListener('mousemove', (e) => {
-    if (!draggingNodeId) return;
     const { x, y } = canvasPoint(e);
-    const p = graphLayout.get(draggingNodeId);
-    if (p) { p.x = x; p.y = y; p.vx = 0; p.vy = 0; }
+    if (draggingNodeId) {
+      const rect = graphCanvas.getBoundingClientRect();
+      const p = graphLayout.get(draggingNodeId);
+      if (p) {
+        const l = screenToLayout(rect, x, y);
+        p.x = l.x; p.y = l.y;
+        p.vx = 0; p.vy = 0;
+      }
+    } else if (panning && lastPan) {
+      graphPanX += x - lastPan.x;
+      graphPanY += y - lastPan.y;
+      lastPan = { x, y };
+    }
   });
   window.addEventListener('mouseup', () => {
     if (draggingNodeId) {
@@ -661,8 +710,138 @@ function initGraphCanvas() {
       if (p) p.pinned = true;
     }
     draggingNodeId = null;
+    panning = false;
+    lastPan = null;
     graphCanvas.style.cursor = 'grab';
   });
+}
+
+// The knowledge tree is a real tree (every node has at most one CHILD_OF
+// parent — see app/graph_store.py), so the old force-directed physics is the
+// wrong tool: it scatters nodes, overlaps labels and crosses edges no matter
+// how the constants are tuned. Layout is now a deterministic tidy-tree pass:
+// each subtree gets a contiguous horizontal band sized from its widest label,
+// children sit in a row beneath their parent, and the result is scaled to fit
+// the canvas so every node is always fully visible.
+const TREE_H_GAP = 36;   // gap between sibling subtrees
+const TREE_ROW_H = 56;   // vertical gap between depth levels
+const TREE_PAD = 30;     // canvas padding around the whole drawing
+let graphScale = 1;      // uniform scale applied to fit the tree on the canvas
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 8;
+let graphZoom = 1;       // user zoom multiplier on top of the fit scale
+let graphPanX = 0;       // camera pan (CSS px)
+let graphPanY = 0;
+
+function graphCenter(rect) {
+  return { x: rect.width / 2, y: rect.height / 2 };
+}
+
+// Camera transform: the tree is laid out in fit-to-canvas coordinates
+// (graphScale baked in); graphZoom/graphPan let the user inspect a portion
+// closely. Both are uniform, so overlap-free labels stay overlap-free.
+function layoutToScreen(rect, x, y) {
+  const c = graphCenter(rect);
+  return { x: c.x + (x - c.x) * graphZoom + graphPanX, y: c.y + (y - c.y) * graphZoom + graphPanY };
+}
+
+function screenToLayout(rect, x, y) {
+  const c = graphCenter(rect);
+  return { x: c.x + (x - c.x - graphPanX) / graphZoom, y: c.y + (y - c.y - graphPanY) / graphZoom };
+}
+
+// Zooms about the point (sx, sy) in screen space, keeping whatever node is
+// under the cursor pinned under it — so a zoom follows the mouse, not the
+// canvas center.
+function zoomAt(sx, sy, factor, rect) {
+  const c = graphCenter(rect);
+  const l = screenToLayout(rect, sx, sy);
+  graphZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, graphZoom * factor));
+  graphPanX = sx - c.x - (l.x - c.x) * graphZoom;
+  graphPanY = sy - c.y - (l.y - c.y) * graphZoom;
+  updateZoomUI();
+}
+
+function updateZoomUI() {
+  const el = document.getElementById('zoomLabel');
+  if (el) el.textContent = Math.round(graphZoom * 100) + '%';
+}
+
+function computeTreeLayout(nodes, edges) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const children = new Map();
+  const parentOf = new Map();
+  for (const n of nodes) children.set(n.id, []);
+  for (const e of edges) {
+    if (children.has(e.source) && children.has(e.target)) {
+      children.get(e.source).push(e.target);
+      parentOf.set(e.target, e.source);
+    }
+  }
+  const roots = nodes.filter((n) => !parentOf.has(n.id)).map((n) => n.id);
+
+  // Each subtree reports how far it reaches LEFT and RIGHT of its root's
+  // centerline. Labels draw only to the right of the circle, so right reach
+  // is driven by the widest label in the subtree; left reach just needs
+  // circle clearance. Sibling bands are laid end-to-end with a fixed gap, so
+  // no two labels can ever overlap.
+  const reach = new Map();
+  const measure = (id) => {
+    if (reach.has(id)) return reach.get(id);
+    const kids = children.get(id) || [];
+    const ownLeft = 15;
+    const ownRight = 12 + (byId.get(id).labelWidth || 0);
+    let left = ownLeft, right = ownRight;
+    if (kids.length) {
+      const widths = kids.map((k) => { const r = measure(k); return r.left + r.right; });
+      const total = widths.reduce((s, w) => s + w, 0) + TREE_H_GAP * (kids.length - 1);
+      const half = total / 2;
+      left = Math.max(ownLeft, half);
+      right = Math.max(ownRight, half);
+    }
+    reach.set(id, { left, right });
+    return { left, right };
+  };
+  roots.forEach(measure);
+
+  const pos = new Map();
+  const place = (id, x, y) => {
+    pos.set(id, { x, y });
+    const kids = children.get(id) || [];
+    if (!kids.length) return;
+    const total = kids.reduce((s, k) => { const r = reach.get(k); return s + r.left + r.right; }, 0) + TREE_H_GAP * (kids.length - 1);
+    let cx = x - total / 2;
+    for (const k of kids) {
+      const r = reach.get(k);
+      place(k, cx + r.left, y + TREE_ROW_H);
+      cx += r.left + r.right + TREE_H_GAP;
+    }
+  };
+  roots.forEach((r) => place(r, 0, 0));
+  return { pos, reach };
+}
+
+function fitPositionsToCanvas(pos, reach, w, h) {
+  if (!pos.size || w <= 0 || h <= 0) return;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const [id, p] of pos) {
+    const r = reach.get(id) || { left: 15, right: 15 };
+    const left = p.x - r.left, right = p.x + r.right;
+    if (left < minX) minX = left;
+    if (right > maxX) maxX = right;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const spanX = Math.max(1, maxX - minX);
+  const spanY = Math.max(1, maxY - minY);
+  const scale = Math.min((w - TREE_PAD * 2) / (spanX + 40), (h - TREE_PAD * 2) / (spanY + 40), 1);
+  graphScale = scale;
+  const offX = (w - spanX * scale) / 2 - minX * scale;
+  const offY = (h - spanY * scale) / 2 - minY * scale;
+  for (const p of pos.values()) {
+    p.x = p.x * scale + offX;
+    p.y = p.y * scale + offY;
+  }
 }
 
 function updateGraphData(nodes, edges) {
@@ -670,32 +849,28 @@ function updateGraphData(nodes, edges) {
   graphEdges = edges || [];
   // loadSession() can resolve before the graph tab's own resize() has taken
   // effect (e.g. the very first load, where initGraphCanvas() measures the
-  // canvas while its section is still display:none). Re-resize here so new
-  // nodes are never seeded around a stale 0x0 rect.
+  // canvas while its section is still display:none). Re-resize here so the
+  // tree is never laid out around a stale 0x0 rect.
   if (resizeGraphCanvasFn) resizeGraphCanvasFn();
   const rect = graphCanvas.getBoundingClientRect();
-  const cx = rect.width / 2, cy = rect.height / 2;
   const seen = new Set(graphNodes.map((n) => n.id));
 
-  // Labels are drawn to the right of each node's circle, so two nodes whose
-  // centers clear the circle-only separation can still have their text
-  // collide. Measure each label once here and let tickGraphPhysics widen
-  // the separation it enforces based on the wider of the two labels.
+  // Measure each label once (labels render to the right of the node circle)
+  // so the tree layout can reserve each subtree a band wide enough for its
+  // longest label — that's what makes overlapping text impossible.
   graphCtx.font = '11px sans-serif';
   for (const n of graphNodes) {
     n.labelWidth = graphCtx.measureText(n.label).width;
   }
 
+  const { pos, reach } = computeTreeLayout(graphNodes, graphEdges);
+  fitPositionsToCanvas(pos, reach, rect.width, rect.height);
+
   for (const n of graphNodes) {
-    if (!graphLayout.has(n.id)) {
-      graphLayout.set(n.id, {
-        x: cx + (Math.random() - 0.5) * 120,
-        y: cy + (Math.random() - 0.5) * 120,
-        vx: 0,
-        vy: 0,
-        pinned: false,
-      });
-    }
+    const existing = graphLayout.get(n.id);
+    const t = pos.get(n.id);
+    if (existing && existing.pinned) continue; // keep nodes the user dragged
+    graphLayout.set(n.id, t || { x: rect.width / 2, y: rect.height / 2, vx: 0, vy: 0, pinned: false });
   }
   for (const id of [...graphLayout.keys()]) {
     if (!seen.has(id)) graphLayout.delete(id);
@@ -703,73 +878,12 @@ function updateGraphData(nodes, edges) {
 }
 
 function resetGraphLayout() {
+  graphZoom = 1;
+  graphPanX = 0;
+  graphPanY = 0;
+  updateZoomUI();
   graphLayout.clear();
   updateGraphData(graphNodes, graphEdges);
-}
-
-function tickGraphPhysics() {
-  if (!graphCanvas) return;
-  const rect = graphCanvas.getBoundingClientRect();
-  const w = rect.width, h = rect.height;
-  const cx = w / 2, cy = h / 2;
-
-  // Node circle (radius 9) plus label text both need clearance, so a soft
-  // inverse-square repulsion alone isn't enough — at low velocity/high
-  // damping it converges to nodes visibly touching/overlapping once there
-  // are more than a handful. MIN_SEPARATION adds a hard positional nudge on
-  // top of the force so nodes and their labels never actually overlap.
-  // Labels sit to the right of the circle and vary widely in length (a bare
-  // "kitchen" vs. a full freeform sentence), so the separation floor scales
-  // with the wider label of each pair rather than using one fixed radius.
-  const BASE_SEPARATION = 46;
-  for (let i = 0; i < graphNodes.length; i++) {
-    const a = graphLayout.get(graphNodes[i].id);
-    if (!a) continue;
-    for (let j = i + 1; j < graphNodes.length; j++) {
-      const b = graphLayout.get(graphNodes[j].id);
-      if (!b) continue;
-      const minSeparation = BASE_SEPARATION + Math.max(graphNodes[i].labelWidth || 0, graphNodes[j].labelWidth || 0);
-      const dx = a.x - b.x, dy = a.y - b.y;
-      const distSq = dx * dx + dy * dy || 0.01;
-      const dist = Math.sqrt(distSq);
-      const force = 1800 / distSq;
-      const fx = (dx / dist) * force, fy = (dy / dist) * force;
-      if (!a.pinned) { a.vx += fx; a.vy += fy; }
-      if (!b.pinned) { b.vx -= fx; b.vy -= fy; }
-
-      if (dist < minSeparation) {
-        const overlap = (minSeparation - dist) / 2;
-        const nx = dx / dist, ny = dy / dist;
-        if (!a.pinned) { a.x += nx * overlap; a.y += ny * overlap; }
-        if (!b.pinned) { b.x -= nx * overlap; b.y -= ny * overlap; }
-      }
-    }
-  }
-
-  for (const e of graphEdges) {
-    const a = graphLayout.get(e.source), b = graphLayout.get(e.target);
-    if (!a || !b) continue;
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-    const rest = 110;
-    const force = (dist - rest) * 0.02;
-    const fx = (dx / dist) * force, fy = (dy / dist) * force;
-    if (!a.pinned) { a.vx += fx; a.vy += fy; }
-    if (!b.pinned) { b.vx -= fx; b.vy -= fy; }
-  }
-
-  for (const n of graphNodes) {
-    const p = graphLayout.get(n.id);
-    if (!p || p.pinned) continue;
-    p.vx += (cx - p.x) * 0.002;
-    p.vy += (cy - p.y) * 0.002;
-    p.vx *= 0.85;
-    p.vy *= 0.85;
-    p.x += p.vx;
-    p.y += p.vy;
-    p.x = Math.max(16, Math.min(w - 16, p.x));
-    p.y = Math.max(16, Math.min(h - 16, p.y));
-  }
 }
 
 function drawGraph() {
@@ -784,24 +898,31 @@ function drawGraph() {
     return;
   }
 
+  const fontScale = graphScale * graphZoom;
+
   graphCtx.strokeStyle = '#3a3f4b';
   graphCtx.fillStyle = '#8a8f99';
-  graphCtx.font = '10px sans-serif';
+  graphCtx.font = `${Math.max(5, 10 * fontScale)}px sans-serif`;
   for (const e of graphEdges) {
     const a = graphLayout.get(e.source), b = graphLayout.get(e.target);
     if (!a || !b) continue;
+    const sa = layoutToScreen(rect, a.x, a.y);
+    const sb = layoutToScreen(rect, b.x, b.y);
     graphCtx.beginPath();
-    graphCtx.moveTo(a.x, a.y);
-    graphCtx.lineTo(b.x, b.y);
+    graphCtx.moveTo(sa.x, sa.y);
+    graphCtx.lineTo(sb.x, sb.y);
     graphCtx.stroke();
-    graphCtx.fillText(e.relation, (a.x + b.x) / 2, (a.y + b.y) / 2);
+    graphCtx.fillText(e.relation, (sa.x + sb.x) / 2, (sa.y + sb.y) / 2);
   }
 
+  const radius = Math.max(4, 9 * fontScale);
+  const labelFont = Math.max(5, 11 * fontScale);
   for (const n of graphNodes) {
     const p = graphLayout.get(n.id);
     if (!p) continue;
+    const s = layoutToScreen(rect, p.x, p.y);
     graphCtx.beginPath();
-    graphCtx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+    graphCtx.arc(s.x, s.y, radius, 0, Math.PI * 2);
     graphCtx.fillStyle = NODE_COLORS[n.type] || NODE_COLORS.container;
     graphCtx.fill();
     graphCtx.strokeStyle = p.pinned ? '#fff' : '#111';
@@ -809,18 +930,18 @@ function drawGraph() {
     graphCtx.stroke();
 
     graphCtx.fillStyle = '#e6e6e6';
-    graphCtx.font = '11px sans-serif';
+    graphCtx.font = `${labelFont}px sans-serif`;
     // Labels normally sit to the right of the node, but that runs off-canvas
     // for nodes pushed toward the right wall — flip to the left there so the
-    // text stays fully visible instead of getting clipped at the edge.
-    const labelWidth = n.labelWidth || 0;
-    const labelX = p.x + 12 + labelWidth > rect.width ? p.x - 12 - labelWidth : p.x + 12;
-    graphCtx.fillText(n.label, labelX, p.y + 4);
+    // text stays fully visible instead of getting clipped at the edge. Widths
+    // are scaled by fontScale to match the drawn font.
+    const labelWidth = (n.labelWidth || 0) * fontScale;
+    const labelX = s.x + 12 * fontScale + labelWidth > rect.width ? s.x - 12 * fontScale - labelWidth : s.x + 12 * fontScale;
+    graphCtx.fillText(n.label, labelX, s.y + 4 * fontScale);
   }
 }
 
 function graphLoop() {
-  tickGraphPhysics();
   drawGraph();
   requestAnimationFrame(graphLoop);
 }
@@ -845,7 +966,22 @@ async function loadSession() {
     renderContext(data.knowledge_nodes, data);
     liveTrace = data.trace;
     renderTrace(liveTrace);
-    renderConversation(data.messages);
+    // A still-open operation_questions batch (session.status "in_progress"
+    // with pending_operation_questions set) has its question text already
+    // sitting in session.messages as plain assistant bubbles (app.chat
+    // appends q["question"] for each one when it holds the turn). Render
+    // those as the interactive MCQ buttons instead of letting
+    // renderConversation flatten them to text — otherwise every full
+    // /state refetch (this function runs after EVERY turn, see
+    // streamChatEvents' finally block) wipes out the buttons
+    // renderOperationQuestions just drew live.
+    const pending = data.status === 'in_progress' ? data.pending_operation_questions : null;
+    const pendingTexts = new Set((pending ? pending.questions : []).map((q) => q.question));
+    const messages = pendingTexts.size
+      ? data.messages.filter((m) => !(m.role === 'assistant' && pendingTexts.has(m.content)))
+      : data.messages;
+    renderConversation(messages);
+    if (pending) renderOperationQuestions(pending.questions);
     const graph = buildGraphFromNodes(data.knowledge_nodes);
     updateGraphData(graph.nodes, graph.edges);
     setStatus(`status: ${data.status} · last loaded ${new Date().toLocaleTimeString()}`);
@@ -874,20 +1010,46 @@ let liveTrace = [];
 // Renders one assistant bubble per clarifying question from an
 // operation_questions SSE event (see app.chat.run_chat_turn's docstring and
 // app.graph._generate_operation_questions), each question line-up followed
-// by a row of buttons — one per LLM-provided option label. Clicking a
-// button answers just that op_id (app.graph.classify_intent_node's resume
-// path already supports a partial answer: only the still-unresolved ops in
-// the batch get re-asked, see tests/test_graph.py's reasks test), so
-// multiple questions in one batch are answered one click at a time rather
-// than requiring every option to be picked before anything submits.
+// by a row of buttons — one per LLM-provided option label — plus ONE shared
+// progress line ("N of total answered") and ONE shared submit button for
+// the whole batch. Clicking an option only updates local state (batch.answers/
+// batch.roomSelections below) and re-highlights .chosen — it can be changed
+// freely, nothing is sent to the server until submit. The submit button
+// stays disabled until every question in the batch has a selection; only
+// then does it fire ONE combined operation_answers reply covering the whole
+// batch (app.graph.classify_intent_node's resume branch already merges a
+// multi-op_id answers dict in one pass, see _merge_resume_answers).
 //
-// For now this only renders the fixed option buttons the model proposed —
-// no free-text input yet, even though the event's `allow_custom: true`
-// signals the API already accepts a typed answer for any op_id (a later
-// pass can add a text field alongside these buttons).
+// This renders the fixed option buttons the model proposed — no free-text
+// input, even though the event's `allow_custom: true` signals the API
+// already accepts a typed answer for any op_id (deliberately deferred,
+// buttons-only for now). A single-option question is the model's confident
+// pick (RoomResolutionItem rule 15, not a real either/or), so it renders
+// with the "recommended" style instead of looking like one plain choice.
 function renderOperationQuestions(questions) {
   const el = document.getElementById('conversationPanel');
   if (el.querySelector('.empty')) el.innerHTML = '';
+
+  const total = (questions || []).length;
+  const batch = { answers: {}, roomSelections: {} }; // op_id -> label / op_id -> room_ids
+
+  const batchDiv = document.createElement('div');
+  batchDiv.className = 'op-batch';
+
+  const progress = document.createElement('div');
+  progress.className = 'op-batch-progress';
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'op-batch-submit';
+  submitBtn.textContent = 'Submit answers';
+  submitBtn.disabled = true;
+
+  const updateProgress = () => {
+    const answered = Object.keys(batch.answers).length;
+    progress.textContent = `${answered} of ${total} answered`;
+    submitBtn.disabled = answered < total;
+  };
+
   (questions || []).forEach((q) => {
     const div = document.createElement('div');
     div.className = 'msg assistant';
@@ -896,38 +1058,57 @@ function renderOperationQuestions(questions) {
 
     const options = document.createElement('div');
     options.className = 'op-options';
+    const recommended = (q.options || []).length === 1;
     (q.options || []).forEach((opt) => {
+      const isBundle = Array.isArray(opt.room_ids) && opt.room_ids.length > 1;
       const btn = document.createElement('button');
-      btn.className = 'op-option-btn';
-      btn.textContent = opt.label;
-      btn.addEventListener('click', () => submitOperationAnswer(q.op_id, opt.label, options));
+      btn.className = 'op-option-btn' + (recommended ? ' recommended' : '') + (isBundle ? ' bundle' : '');
+      btn.textContent = recommended ? `${opt.label} (recommended)` : opt.label;
+      btn.addEventListener('click', () => {
+        [...options.querySelectorAll('.op-option-btn')].forEach((b) => b.classList.remove('chosen'));
+        btn.classList.add('chosen');
+        batch.answers[q.op_id] = opt.label;
+        if (isBundle) batch.roomSelections[q.op_id] = opt.room_ids;
+        else delete batch.roomSelections[q.op_id];
+        updateProgress();
+      });
       options.appendChild(btn);
     });
     div.appendChild(options);
-
-    el.appendChild(div);
+    batchDiv.appendChild(div);
   });
+
+  batchDiv.appendChild(progress);
+  submitBtn.addEventListener('click', () => submitOperationAnswers(batch, batchDiv));
+  batchDiv.appendChild(submitBtn);
+  updateProgress();
+
+  el.appendChild(batchDiv);
   el.scrollTop = el.scrollHeight;
 }
 
-// Answers ONE op_id from a rendered operation_questions batch and resumes
-// the turn — see app.chat.ChatRequest.operation_answers ({op_id: chosen_value},
-// here always an option's own label). message is deliberately empty: the
-// resume path reads pending_operation_questions/operation_answers off the
-// session, not the message text (app.graph.classify_intent_node).
-async function submitOperationAnswer(opId, label, optionsRowEl) {
-  [...optionsRowEl.querySelectorAll('.op-option-btn')].forEach((b) => {
-    b.disabled = true;
-    if (b.textContent === label) b.classList.add('chosen');
-  });
+// Submits every answer collected in a rendered operation_questions batch in
+// ONE resume turn — see app.chat.ChatRequest.operation_answers
+// ({op_id: chosen_value, ...}, each value an option's own label) and
+// operation_room_selections ({op_id: room_ids, ...} for a bundled
+// multi-room pick — app.llm.RoomResolutionOption's multi-room rule;
+// app.graph.classify_intent_node's resume branch fans that ONE op out into
+// one write task per room). message is deliberately empty: the resume path
+// reads pending_operation_questions/operation_answers off the session, not
+// the message text.
+async function submitOperationAnswers(batch, batchDiv) {
+  batchDiv.querySelectorAll('button').forEach((b) => (b.disabled = true));
 
   const sid = document.getElementById('sessionId').value.trim() || null;
-  appendLiveMessage('user', label);
-  await streamChatEvents(sid ? { session_id: sid, message: '', operation_answers: { [opId]: label } } : { message: '', operation_answers: { [opId]: label } });
+  Object.values(batch.answers).forEach((label) => appendLiveMessage('user', label));
+  const body = { message: '', operation_answers: batch.answers };
+  if (sid) body.session_id = sid;
+  if (Object.keys(batch.roomSelections).length) body.operation_room_selections = batch.roomSelections;
+  await streamChatEvents(body);
 }
 
 // Shared SSE consumption for both a typed message (sendMessage) and a
-// clarifying-question answer (submitOperationAnswer) — fetches /chat,
+// clarifying-question batch (submitOperationAnswers) — fetches /chat,
 // streams the event-per-line body, and dispatches each event onto the
 // conversation/trace panels. See app.chat.run_chat_turn's docstring for the
 // full event catalog.
@@ -971,19 +1152,15 @@ async function streamChatEvents(body) {
         } else if (evt.type === 'trace') {
           liveTrace = liveTrace.concat(evt.entries);
           renderTrace(liveTrace);
-        } else if (evt.type === 'context_updated') {
-          // update_context turns never stream an "answer" (no generate_answer
-          // call on that branch), so the pending assistant bubble created for
-          // streaming is still empty — drop it in favor of the confirmation.
+        } else if (evt.type === 'pipeline_result') {
+          // app.pipeline.run_pipeline's single join-step reply — replaces
+          // the old separate context_updated/ask_question/confirm_change/
+          // wrapup events (see app.chat.run_chat_turn's docstring). message
+          // is either the next question (is_question=true) or a closing/
+          // completion line; either way it's not streamed token-by-token,
+          // so the pending assistant bubble is still empty here — drop it.
           if (!answerText) liveAssistant.remove();
           appendLiveMessage('assistant', evt.message);
-        } else if (evt.type === 'ask_question') {
-          appendLiveMessage('assistant', evt.question);
-        } else if (evt.type === 'confirm_change') {
-          // A critical-tier field changed value — app.graph.build_context_node
-          // held it back pending a yes/no reply instead of silently
-          // overwriting (see app.context_builder.detect_conflicts).
-          appendLiveMessage('assistant', evt.question);
         } else if (evt.type === 'operation_questions') {
           // classify_intent_node held the whole write batch back — at least
           // one op's graph connection is still null and the model judged
@@ -991,12 +1168,6 @@ async function streamChatEvents(body) {
           // Nothing writes until every question below is answered.
           if (!answerText) liveAssistant.remove();
           renderOperationQuestions(evt.questions);
-        } else if (evt.type === 'wrapup') {
-          // Closing statement sent once the intake completes — same
-          // pending-bubble handling as context_updated above, since this
-          // never streams a separate "answer" either.
-          if (!answerText) liveAssistant.remove();
-          appendLiveMessage('assistant', evt.message);
         } else if (evt.type === 'image_description') {
           appendLiveMessage('assistant', '[image] ' + evt.content);
         } else if (evt.type === 'error') {
@@ -1036,6 +1207,20 @@ document.getElementById('chatInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') sendMessage();
 });
 document.getElementById('resetLayoutBtn').addEventListener('click', resetGraphLayout);
+document.getElementById('zoomInBtn').addEventListener('click', () => {
+  const rect = graphCanvas.getBoundingClientRect();
+  zoomAt(rect.width / 2, rect.height / 2, 1.25, rect);
+});
+document.getElementById('zoomOutBtn').addEventListener('click', () => {
+  const rect = graphCanvas.getBoundingClientRect();
+  zoomAt(rect.width / 2, rect.height / 2, 0.8, rect);
+});
+document.getElementById('resetZoomBtn').addEventListener('click', () => {
+  graphZoom = 1;
+  graphPanX = 0;
+  graphPanY = 0;
+  updateZoomUI();
+});
 document.getElementById('newSessionBtn').addEventListener('click', () => {
   document.getElementById('sessionId').value = '';
   document.getElementById('contextPanel').innerHTML = '<div class="empty">No session loaded</div>';
