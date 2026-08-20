@@ -32,6 +32,11 @@ class GraphState(TypedDict):
     # no explicit "unskip" (see app.question_engine.find_knowledge_gaps'
     # auto-advance).
     skipped_rooms: list[str]
+    # Set True once ProjectType has been asked about and the turn answering
+    # it passed without filling it in — only room existence stays a
+    # blocking gap after that. See ChatSession.project_type_skipped /
+    # app.pipeline.run_pipeline.
+    project_type_skipped: bool
     # {"canonical_paths", "room_id"} for the field(s) the LAST turn's
     # question was about — read only by classify_intent_node (feeds
     # decline-detection via room_id). Written by app.chat from the previous
@@ -72,18 +77,17 @@ class GraphState(TypedDict):
     # Serialized app.question_engine.KnowledgeGapBatch for the still-open
     # field(s), if any — written by app.pipeline.run_pipeline every turn.
     pending_gap: Optional[dict]
-    # DIRECT_ANSWER's streamed reply text, if this turn had one.
-    answer: str
-    # The pipeline's single join-step summary output (see
-    # app.pipeline.run_pipeline / app.llm.generate_turn_summary) — each is
-    # None when that piece didn't apply this turn.
-    database_summary: Optional[str]
+    # The pipeline's single join-step reply (see app.pipeline.run_pipeline /
+    # app.llm.generate_turn_reply) — the turn's one user-facing text, folding
+    # in a direct answer, database results, and either the next question or
+    # a closing/completion line, whichever apply this turn. Named "reply",
+    # NOT "message": GraphState.message is already this turn's own user
+    # input text.
+    reply: str
+    # context_summary/changes_summary are the join step's table outputs —
+    # each is None when that piece didn't apply this turn.
     context_summary: Optional[str]
     changes_summary: Optional[str]
-    # The next question to ask, or a closing/completion line — see
-    # `is_question`. Named "next_message", NOT "message": GraphState.message
-    # is already this turn's own user input text.
-    next_message: Optional[str]
     is_question: bool
     # True once nothing is left open project-wide (question_engine.
     # find_knowledge_gaps returned None) — app.pipeline.run_pipeline also
@@ -613,7 +617,7 @@ async def run_pipeline_node(state: GraphState) -> dict:
             "run_pipeline",
             None,
             state["message"],
-            result.get("next_message") or result.get("answer") or "",
+            result.get("reply") or "",
             start,
         )
         span.update(input=entry.input_summary, output=entry.output_summary)

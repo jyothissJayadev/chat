@@ -16,6 +16,17 @@ async def test_find_knowledge_gaps_starts_with_project_type_on_an_empty_project(
     assert batch.room_id is None
 
 
+async def test_find_knowledge_gaps_moves_past_project_type_once_skipped():
+    """ProjectType is not mandatory — only room existence is (see
+    ChatSession.project_type_skipped). Once the caller signals it's already
+    been asked once, an empty project must go straight to room existence
+    instead of re-asking about ProjectType forever."""
+    batch = await find_knowledge_gaps("proj-gap-empty-skip-project-type", project_type_skipped=True)
+    assert len(batch.gaps) == 1
+    assert batch.gaps[0].canonical_path == "Project.Rooms.<new>"
+    assert batch.gaps[0].node_type == "RoomType"
+
+
 async def test_find_knowledge_gaps_asks_for_a_room_once_project_type_is_set():
     project_id = "proj-gap-no-room"
     await apply_to_graph(project_id, [ProposedWrite(canonical_path="Project.BasicInformation.ProjectType", node_type="ProjectType", value="renovation", tier="critical")])

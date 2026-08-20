@@ -164,9 +164,40 @@ async def test_render_tree_text_shows_nested_parts_and_properties():
 
     tree = await context_builder.render_project_tree_text(project_id)
     assert "Furniture.sofa" in tree
-    assert "Properties.color" in tree, "the color property must render nested under the sofa"
-    assert "Parts.pillows" in tree, "the pillows part must render nested under the sofa"
+    # Properties/Parts render as an explicit wrapper line ("Properties" /
+    # "Parts") with each child's bare slug nested under it — not
+    # self-prefixed ("Properties.color") the way a top-level room instance
+    # is, because that wrapper already contributes the "Properties"/"Parts"
+    # path segment once. Self-prefixing on top of it would make a model
+    # reconstructing the canonical path by walking the tree top-down see
+    # that segment twice (see test_render_tree_text_room_header_is_not_self_prefixed
+    # for the room-level version of this same bug).
+    assert "Properties" in tree and "color" in tree, "the color property must render nested under the sofa"
+    assert "Parts" in tree and "pillows" in tree, "the pillows part must render nested under the sofa"
+    assert "Properties.Properties" not in tree, "composite child header must not repeat its own wrapper's segment"
+    assert "Parts.Parts" not in tree, "composite child header must not repeat its own wrapper's segment"
     assert 'Quantity="2"' in tree
+
+
+async def test_render_tree_text_room_header_is_not_self_prefixed():
+    """A room's own tree line must be its bare room_id, not "Rooms.<id>" —
+    the "Rooms" section wrapper one level up already contributes that
+    segment. Self-prefixing on top of it makes a model reconstructing the
+    real canonical path by walking the tree top-down (Project -> Rooms ->
+    <room's own header>) see "Rooms" twice, producing
+    "Project.Rooms.Rooms.<id>" — a path that has never existed in Neo4j —
+    instead of the real "Project.Rooms.<id>". This is exactly what broke
+    CONTEXT_DELETE for "remove the living room" in production: `resolve_context_changes`
+    copied the (buggy, doubled) path verbatim from the tree, and validation
+    correctly rejected it since no such node ever existed."""
+    project_id = "proj-room-header-render"
+    await context_builder.apply_to_graph(
+        project_id,
+        [ProposedWrite(canonical_path=f"Project.Rooms.{ROOM_ID}.RoomType", node_type="RoomType", value="living room", room_id=ROOM_ID, tier="critical")],
+    )
+    tree = await context_builder.render_project_tree_text(project_id)
+    assert f"Rooms.{ROOM_ID}" not in tree, "the room's own header must not repeat the \"Rooms\" wrapper's segment"
+    assert ROOM_ID in tree
 
 
 async def _zero_embed(texts: list[str]) -> list[list[float]]:

@@ -123,7 +123,40 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 # ontology rather than a hand-duplicated list — a real path's first
 # root-relative segment is always one of these (see is_grounded_connection).
 _ONTOLOGY_TOP_LEVEL = set(_ONTOLOGY["Project"]["children"])
-_CONNECTION_ROOM_RE = re.compile(r"^Rooms\.([^.]+)")
+# Room ids are always minted as uuid4().hex[:8] (see app.pipeline._run_first_action's
+# new-room branch) — 8 lowercase hex characters, never anything else. Matching
+# that exact shape (rather than the old "any non-dot run" [^.]+) is what makes
+# room_id_from_connection reject a leaked prompt-example placeholder like
+# "<living_room_id>" instead of extracting it verbatim and using it to fabricate
+# a real "Rooms.<living_room_id>" node — see the postmortem on session
+# 36af868e for how that happened live.
+_CONNECTION_ROOM_RE = re.compile(r"^Rooms\.([0-9a-f]{8})(?:\.|$)")
+
+
+def to_full_path(root_relative_path: str) -> str:
+    """Prepends the "Project." root segment to a root-relative path — the
+    classifier's `connection`, or a resolver's `existing_path`/deletion
+    target, all root-relative per the prompt/tree convention documented on
+    is_grounded_connection below — to get the full canonical_path
+    graph_store/Neo4j actually stores things under. Callers that query or
+    write via graph_store (app.pipeline._apply_entity_edit,
+    app.pipeline._apply_deletions) need this; callers stuck comparing
+    against a root-relative set (app.llm._validate_context_changes) should
+    use to_root_relative on the OTHER side instead of calling this at all —
+    see that function's postmortem note for why "compare full against
+    root-relative" was the actual bug, not a missing conversion here."""
+    return f"Project.{root_relative_path}"
+
+
+def to_root_relative(full_path: str) -> str:
+    """Inverse of to_full_path — strips the "Project." root segment off a
+    real canonical_path (as read from graph_store) to get the root-relative
+    form the classifier/resolver prompts and their `connection`/
+    `existing_path`/deletion-target fields use. The bare "Project" root node
+    itself (never a valid existing_path/deletion target) is returned
+    unchanged, same as any other path with no "Project." prefix to strip."""
+    prefix = "Project."
+    return full_path[len(prefix):] if full_path.startswith(prefix) else full_path
 
 
 def is_grounded_connection(connection: str) -> bool:
@@ -174,6 +207,19 @@ def split_connection(connection: Optional[str]) -> tuple[Optional[str], Optional
         return None, None, None
     if is_grounded_connection(connection):
         room_id = room_id_from_connection(connection)
+        # A "Rooms.something" connection whose room segment doesn't match the
+        # real uuid4().hex[:8] id shape is not actually grounded — most often
+        # a leaked prompt-example placeholder (e.g. "Rooms.<living_room_id>")
+        # that an upstream classifier echoed instead of substituting a real
+        # id. Treating this as room_hint=connection would be worse than doing
+        # nothing: app.pipeline._run_first_action mints a brand-new room from
+        # any non-None room_hint, so it would create a room whose RoomType is
+        # the literal garbage string. Falling all the way through to
+        # (None, None, None) instead sends the mention to the project-level
+        # Unmapped bucket (see canonical_mapper._container_path) for manual
+        # review — visible and inert, not a fabricated room.
+        if connection.startswith("Rooms.") and room_id is None:
+            return None, None, None
         # Deeper than "Rooms.<id>" => the tail beyond the room id is an
         # existing instance path the operation targets (e.g. "Furniture.beds").
         # Reconstruct the root-relative parent instance path; only set when
@@ -306,11 +352,24 @@ async def _best_type_match(query_vec: list[float]) -> tuple[str, float]:
 async def ensure_path(canonical_path: str, project_id: str) -> KnowledgeNode:
     """Get-or-create every node along canonical_path, in order, returning the
     deepest one. A segment matching an ontology/v1.yaml key is typed as
-    itself (e.g. "Rooms", "Furniture"); any other segment is a room instance
-    id directly under "Project.Rooms" (mirrors scripts/migrate_partial_context_to_tree.py's
-    convention: the container "Project.Rooms" and each room instance
-    "Project.Rooms.<room_id>" are both node_type="Rooms" — container vs.
-    instance is a path-depth distinction, not a type distinction).
+    itself (e.g. "Rooms", "Furniture"); any other segment inherits its
+    parent's node_type. That covers two distinct cases with one rule: a room
+    instance id directly under "Project.Rooms" (mirrors
+    scripts/migrate_partial_context_to_tree.py's convention: the container
+    "Project.Rooms" and each room instance "Project.Rooms.<room_id>" are both
+    node_type="Rooms" — container vs. instance is a path-depth distinction,
+    not a type distinction) — AND a freeform instance slug under a
+    Materials/Furniture/Parts/Properties/... container (e.g.
+    "...Materials.flooring" must be node_type="Materials", matching
+    app/context_builder.py's `_is_container` assumption that a container
+    shares its instances' node_type). Inheriting from parent handles both:
+    "Project.Rooms" itself is node_type="Rooms" (an ontology key), so a room
+    id under it inherits "Rooms"; a Materials container is node_type=
+    "Materials", so an instance slug under it inherits "Materials". Previously
+    hardcoded to "Rooms" for every non-ontology segment regardless of parent,
+    which was only ever correct for the room-id case — see the CONTEXT TABLE
+    plan for how this silently dropped every structured-extraction materials/
+    furniture write from app.context_builder.render_project_tree_text.
 
     Public (not `_`-prefixed): shared with app/context_builder.py (Phase 7),
     which needs the same get-or-create-ancestors behavior for structured
@@ -323,7 +382,12 @@ async def ensure_path(canonical_path: str, project_id: str) -> KnowledgeNode:
         path = ".".join(current_parts)
         existing = await graph_store.find_one(project_id, path)
         if existing is None:
-            node_type = segment if segment in _ONTOLOGY else "Rooms"
+            if segment in _ONTOLOGY:
+                node_type = segment
+            elif parent is not None:
+                node_type = parent.node_type
+            else:
+                node_type = "Rooms"  # unreachable in practice: the first segment ("Project") is always an ontology key
             if parent is not None and parent.canonical_path == "Project.Rooms":
                 room_id = segment  # this segment IS a room instance id
             else:

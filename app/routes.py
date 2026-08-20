@@ -36,6 +36,7 @@ async def get_session_state(session_id: str):
         "project_id": session.project_id,
         "status": session.status,
         "skipped_rooms": session.skipped_rooms,
+        "project_type_skipped": session.project_type_skipped,
         "current_field": session.current_field,
         "pending_gap": session.pending_gap,
         "pending_operation_questions": session.pending_operation_questions,

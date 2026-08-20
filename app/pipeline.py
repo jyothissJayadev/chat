@@ -17,18 +17,30 @@ Dependency shape for one turn:
     canonical_mapper.resolve_deletion_target), and freeform entity
     reuse-vs-create still goes through canonical_mapper.map_to_canonical's
     algorithmic alias/embedding dedup.
-  - CONTEXT_RETRIEVAL waits for the first action (if any) to land, so it can
-    see post-write state; with no write this turn it runs immediately.
-  - DATABASE_RETRIEVAL and DIRECT_ANSWER both start immediately, fully
-    concurrent with everything else — DIRECT_ANSWER's result bypasses the
-    join/summary entirely (it never depends on this turn's own writes).
-  - pending_gap is fetched concurrently too.
-  - Once first action (if any) + context retrieval (if any) + database
-    query (if any) + pending_gap are all done, ONE summary LLM call
-    (app.llm.generate_turn_summary) turns whatever pieces actually happened
-    into the turn's reply: a database-results summary, a context-retrieval
-    summary, a changes-made summary, and either the next question or a
-    completion line.
+  - CONTEXT_RETRIEVAL no longer runs its own node fetch. `pieces["project_context"]`
+    (below) is now the complete, single source of truth for "what's in the
+    project" — a CONTEXT_RETRIEVAL task only contributes its `.target` text,
+    joined into `pieces["context_retrieval_request"]`, so generate_turn_reply
+    can build context_summary itself straight off the tree already in its
+    system prompt.
+  - DATABASE_RETRIEVAL starts immediately, fully concurrent with everything
+    else. ANSWER tasks produce no LLM call of their own any more — their
+    `.target` text is just joined into `pieces["direct_answer_request"]` for
+    the join step below.
+  - project_context (app.context_builder.render_project_tree_text — the
+    whole live tree, not just the active room) is fetched only after first
+    action (if any) lands, same as pending_gap: it now grounds BOTH the
+    ANSWER block and CONTEXT_RETRIEVAL's context_summary, so — unlike the
+    old per-room known_fields lookup, which only ever grounded ANSWER and
+    could safely start pre-write — it must see this turn's own writes before
+    a "what's in my project now" question can be answered correctly.
+  - Once first action (if any) + database query (if any) + project_context +
+    pending_gap are all done, ONE join LLM call (app.llm.generate_turn_reply)
+    runs — every turn, unconditionally — and turns whatever pieces actually
+    happened (a direct answer, database results, changes made, a context
+    request, the next open field) into the turn's single `reply`. This is
+    the only LLM call that produces the turn's user-facing text; there is
+    never a second one.
 """
 
 import asyncio
@@ -42,10 +54,10 @@ from langgraph.config import get_stream_writer
 from pydantic import BaseModel
 from rapidfuzz import fuzz
 
-from app import calculation, canonical_mapper, context_builder, graph_store, inference, llm, question_engine, rag, retrieval, versioning
+from app import calculation, canonical_mapper, context_builder, graph_store, inference, llm, question_engine, rag, versioning
 from app.config import settings
 from app.context_builder import ProposedWrite
-from app.models import FIELD_TIERS, KnowledgeNode, ProjectContext, TraceEntry
+from app.models import FIELD_TIERS, ProjectContext, TraceEntry
 from app.tasks import TaskSpec, TaskType
 from app.understanding import TASK_TYPE_TO_INTENT
 
@@ -99,7 +111,7 @@ class FirstActionResult(BaseModel):
     written: list[str] = []
     retracted: list[str] = []
     # {"path", "before", "after", "action"} per touched node — the raw
-    # material app.llm.generate_turn_summary's changes_summary is built from.
+    # material app.llm.generate_turn_reply's changes_summary is built from.
     changes: list[dict] = []
     active_room_id: Optional[str] = None
 
@@ -119,6 +131,7 @@ def _fields_to_proposed_writes(fields: "llm.ContextChangeFields", room_id: Optio
     add("timeline", "Project.Timeline.Value", "Value", fields.timeline)
 
     if room_id:
+        add("roomType", f"Project.Rooms.{room_id}.RoomType", "RoomType", fields.roomType)
         add("budgetOrRequirement", f"Project.Rooms.{room_id}.Budget", "Budget", fields.budgetOrRequirement)
         add("style", f"Project.Rooms.{room_id}.Style", "Style", fields.style)
         add("squareFootage", f"Project.Rooms.{room_id}.SquareFootage", "SquareFootage", fields.squareFootage)
@@ -133,8 +146,13 @@ def _fields_to_proposed_writes(fields: "llm.ContextChangeFields", room_id: Optio
     return proposed
 
 
-async def _apply_deletions(project_id: str, paths: list[str], changes: list[dict], retracted: list[str]) -> None:
-    for path in paths:
+async def _apply_deletions(project_id: str, root_relative_paths: list[str], changes: list[dict], retracted: list[str]) -> None:
+    """`root_relative_paths` is `result.deletion_targets` — root-relative,
+    same convention as `connection` (see canonical_mapper.to_full_path).
+    Converted to the "Project."-prefixed form once per target before ever
+    touching graph_store, which stores/looks up the full path."""
+    for root_relative_path in root_relative_paths:
+        path = canonical_mapper.to_full_path(root_relative_path)
         node = await graph_store.find_one(project_id, path)
         if node is None or node.lifecycle == "retracted":
             continue
@@ -156,14 +174,23 @@ async def _apply_entity_edit(project_id: str, mention: "llm.FreeformEntityChange
     exist and are legal before this ever runs. Bypasses
     canonical_mapper.map_to_canonical entirely: this IS the entity (named by
     exact path, not re-derived by embedding similarity), so there's no
-    reuse-vs-create decision left to make."""
-    entity = await graph_store.find_one(project_id, mention.existing_path)
+    reuse-vs-create decision left to make.
+
+    `mention.existing_path` is root-relative (same convention as
+    `connection` — see canonical_mapper.to_full_path); graph_store wants the
+    "Project."-prefixed form, so every path used here is converted once up
+    front rather than passing the root-relative string straight into
+    graph_store.find_one, which can never match anything (this was the
+    actual bug behind session a3a41e7a's "does not exist in CURRENT DATA
+    TREE" failures on otherwise-correct edits)."""
+    full_existing_path = canonical_mapper.to_full_path(mention.existing_path)
+    entity = await graph_store.find_one(project_id, full_existing_path)
     if entity is None:
         # The validator confirmed this path existed when the LLM call ran;
         # a concurrent change mid-turn is the only way it's gone now — treat
         # as a no-op rather than crash on a stale reference.
         return
-    leaf_path = f"{mention.existing_path}.{mention.field}"
+    leaf_path = f"{full_existing_path}.{mention.field}"
     before_node = await graph_store.find_one(project_id, leaf_path)
     before_value = before_node.value if before_node else None
     write = ProposedWrite(canonical_path=leaf_path, node_type=mention.field, value=mention.value, room_id=entity.room_id)
@@ -257,10 +284,9 @@ async def _apply_parts(
     for part in parts:
         if part.existing_path is not None and part.field is not None:
             # Editing an existing part's leaf — same path/field contract as
-            # _apply_entity_edit, just on a part. existing_path is
-            # root-relative; graph_store wants the "Project."-prefixed form.
+            # _apply_entity_edit, just on a part.
             await _write_leaf(
-                project_id, f"Project.{part.existing_path}.{part.field}", part.field, part.value,
+                project_id, f"{canonical_mapper.to_full_path(part.existing_path)}.{part.field}", part.field, part.value,
                 room_id, changes, written,
             )
             continue
@@ -370,10 +396,18 @@ async def _run_first_action(project_id: str, write_tasks: list[TaskSpec], start:
     # llm.resolve_context_changes as ground truth for its semantic
     # validation layer (does a claimed deletion_target/existing_path really
     # exist? is a claimed field legal for that node's own type?) — see
-    # app.llm._validate_context_changes.
+    # app.llm._validate_context_changes. Keyed root-relative (canonical_
+    # mapper.to_root_relative), NOT graph_store's raw "Project."-prefixed
+    # canonical_path: the resolver's existing_path/deletion_targets are
+    # root-relative, same convention as connection and as CURRENT DATA TREE
+    # itself (context_builder.render_project_tree_text) — comparing them
+    # against full paths meant a correctly-instructed model's output could
+    # never validate as "exists," silently dropping every genuine edit/
+    # deletion whose path didn't happen to already carry a stray "Project."
+    # prefix. See the postmortem on session a3a41e7a.
     live_nodes = await graph_store.find_nodes(project_id, lifecycle="active")
-    existing_paths = {n.canonical_path for n in live_nodes}
-    node_types_by_path = {n.canonical_path: n.node_type for n in live_nodes}
+    existing_paths = {canonical_mapper.to_root_relative(n.canonical_path) for n in live_nodes}
+    node_types_by_path = {canonical_mapper.to_root_relative(n.canonical_path): n.node_type for n in live_nodes}
 
     operations = [{"text": t.target or "", "intent": TASK_TYPE_TO_INTENT[t.type], "connection": t.connection} for t in write_tasks]
     capture: dict = {}
@@ -420,7 +454,7 @@ async def _run_first_action(project_id: str, write_tasks: list[TaskSpec], start:
 
     # Anything the LLM claimed but couldn't back up after a validation
     # retry (app.llm.resolve_context_changes) — surfaced as a "failed"
-    # change so generate_turn_summary's changes_summary can mention it,
+    # change so generate_turn_reply's changes_summary can mention it,
     # rather than silently doing nothing for that one claim.
     for issue in issues:
         changes.append({"path": None, "before": None, "after": None, "action": "failed", "reason": issue.detail})
@@ -440,32 +474,14 @@ async def _run_first_action(project_id: str, write_tasks: list[TaskSpec], start:
 
 # ---------------------------------------------------------------------------
 # CONTEXT_RETRIEVAL
-# ---------------------------------------------------------------------------
-
-
-async def _run_context_retrieval(project_id: str, retrieval_tasks: list[TaskSpec]) -> list[KnowledgeNode]:
-    nodes: list[KnowledgeNode] = []
-    seen_paths: set[str] = set()
-    for task in retrieval_tasks:
-        room_id, _hint, _parent = canonical_mapper.split_connection(task.connection)
-        root_path = f"Project.Rooms.{room_id}" if room_id else "Project"
-        for node in await retrieval.load_subtree(project_id, root_path):
-            if node.canonical_path not in seen_paths:
-                seen_paths.add(node.canonical_path)
-                nodes.append(node)
-    return nodes
-
-
-def _format_retrieved_nodes(nodes: list[KnowledgeNode]) -> list[dict]:
-    formatted = []
-    for node in nodes:
-        if node.value is None:
-            continue
-        field_name = context_builder.LEAF_TO_FIELD_NAME.get(node.node_type, node.node_type)
-        formatted.append({"field": field_name, "value": node.value})
-    return formatted
-
-
+#
+# No dedicated node fetch any more — pieces["project_context"] (the full,
+# post-write project tree, built by run_pipeline below) already contains
+# everything a scoped fetch would have returned, so a CONTEXT_RETRIEVAL task
+# only needs to contribute the client's own request text; generate_turn_reply
+# builds context_summary itself from that text + the tree already in its
+# system prompt. See app.retrieval for the older per-node-fetch approach
+# (still exercised by tests/test_retrieval.py, no longer called live).
 # ---------------------------------------------------------------------------
 # DATABASE_RETRIEVAL
 # ---------------------------------------------------------------------------
@@ -495,33 +511,6 @@ async def _run_database_query(query_tasks: list[TaskSpec], message_fallback: str
         llm_output=llm_output,
     )
     return results, entry
-
-
-# ---------------------------------------------------------------------------
-# DIRECT_ANSWER
-# ---------------------------------------------------------------------------
-
-
-async def _run_direct_answer(state: dict, answer_tasks: list[TaskSpec], writer) -> tuple[str, TraceEntry]:
-    start = time.perf_counter()
-    message = " ".join(t.target for t in answer_tasks if t.target) or state["message"]
-    context = await context_builder.known_fields(state["project_id"], None)
-    capture: dict = {}
-    chunks: list[str] = []
-    async for token in llm.generate_answer(message, context, state.get("history", ""), "", capture=capture):
-        chunks.append(token)
-        writer({"type": "answer_token", "token": token})
-    answer = "".join(chunks)
-    entry = _trace(
-        "direct_answer",
-        settings.model_answer,
-        message,
-        answer,
-        start,
-        llm_input=capture.get("messages"),
-        llm_output=answer,
-    )
-    return answer, entry
 
 
 # ---------------------------------------------------------------------------
@@ -559,19 +548,21 @@ async def run_pipeline(state: dict) -> dict:
     retrieval_tasks = [t for t in tasks if t.type == TaskType.RETRIEVE_CONTEXT]
     query_tasks = [t for t in tasks if t.type == TaskType.DATABASE_QUERY]
     answer_tasks = [t for t in tasks if t.type == TaskType.ANSWER]
+    direct_answer_request = " ".join(t.target for t in answer_tasks if t.target) or None
+    context_retrieval_request = " ".join(t.target for t in retrieval_tasks if t.target) or None
 
     writer = _stream_writer()
     trace: list[TraceEntry] = []
 
-    # DIRECT_ANSWER and DATABASE_RETRIEVAL start immediately, independent of
-    # the write step — see module docstring. pending_gap is NOT started here
-    # even though it doesn't block on retrieval/query: find_knowledge_gaps
-    # reads the same live KnowledgeNode graph the write step is about to
-    # mutate, so scheduling it this early would let it race ahead and read
-    # PRE-write state — exactly the bug CONTEXT_RETRIEVAL's own "wait for
-    # first action" rule exists to avoid. It's scheduled below, after
-    # first_action, instead.
-    answer_future = asyncio.ensure_future(_run_direct_answer(state, answer_tasks, writer)) if answer_tasks else None
+    # DATABASE_RETRIEVAL starts immediately, independent of the write step —
+    # it doesn't read the KnowledgeNode graph at all. project_context does
+    # NOT start here any more: it's now the single, complete, post-write
+    # project tree (context_builder.render_project_tree_text) that grounds
+    # BOTH the ANSWER block and CONTEXT_RETRIEVAL's context_summary, so it
+    # needs the same "wait for first action" guarantee pending_gap already
+    # requires — starting it early would let it race ahead of this turn's
+    # own writes and hand the join step stale (pre-write) data for a
+    # question about what THIS turn just changed.
     query_future = asyncio.ensure_future(_run_database_query(query_tasks, state["message"])) if query_tasks else None
 
     first_action: Optional[FirstActionResult] = None
@@ -581,21 +572,27 @@ async def run_pipeline(state: dict) -> dict:
         writer({"type": "operation_progress", "stage": "first_action", "ok": True})
         trace.append(first_action_entry)
 
-    # CONTEXT_RETRIEVAL and pending_gap both read the live KnowledgeNode
-    # graph, so both must only start now — after the write step above (if
-    # any) has landed — same reasoning for both. Neither depends on the
-    # other's result, so they run concurrently with each other from here.
-    retrieval_future = asyncio.ensure_future(_run_context_retrieval(project_id, retrieval_tasks)) if retrieval_tasks else None
-    gap_future = asyncio.ensure_future(
-        question_engine.find_knowledge_gaps(project_id, state.get("active_room_id"), state.get("skipped_rooms") or [])
-    )
-
-    retrieval_nodes: list[KnowledgeNode] = []
-    if retrieval_future is not None:
-        start = time.perf_counter()
-        retrieval_nodes = await retrieval_future
+    if retrieval_tasks:
         writer({"type": "operation_progress", "stage": "context_retrieval", "ok": True})
-        trace.append(_trace("context_retrieval", None, "; ".join(t.target or "" for t in retrieval_tasks), f"{len(retrieval_nodes)} node(s)", start))
+
+    # project_context and pending_gap both read the live KnowledgeNode graph
+    # and must only start now — after the write step above (if any) has
+    # landed. Neither depends on the other's result, so they run
+    # concurrently with each other from here.
+    project_context_future = asyncio.ensure_future(context_builder.render_project_tree_text(project_id))
+    # ProjectType is asked at most once: if the turn we're about to process
+    # was itself answering a ProjectType question (this turn's incoming
+    # pending_gap), it's used up regardless of whether the reply actually
+    # filled it in — see ChatSession.project_type_skipped.
+    incoming_gap_paths = {g["canonical_path"] for g in (state.get("pending_gap") or {}).get("gaps") or []}
+    project_type_skipped = bool(state.get("project_type_skipped")) or (
+        "Project.BasicInformation.ProjectType" in incoming_gap_paths
+    )
+    gap_future = asyncio.ensure_future(
+        question_engine.find_knowledge_gaps(
+            project_id, state.get("active_room_id"), state.get("skipped_rooms") or [], project_type_skipped
+        )
+    )
 
     query_results: list[dict] = []
     if query_future is not None:
@@ -603,6 +600,7 @@ async def run_pipeline(state: dict) -> dict:
         writer({"type": "operation_progress", "stage": "database_query", "ok": True})
         trace.append(query_entry)
 
+    project_context = await project_context_future
     gap_batch = await gap_future
 
     active_room_id = (first_action.active_room_id if first_action else None) or state.get("active_room_id")
@@ -611,49 +609,47 @@ async def run_pipeline(state: dict) -> dict:
     if complete:
         await _materialize_project(state)
 
-    need_summary = bool(write_tasks or retrieval_tasks or query_tasks or gap_batch is not None)
-    turn_summary = None
-    if need_summary:
-        pieces = {
-            "changes": first_action.changes if first_action else [],
-            "context_retrieval": _format_retrieved_nodes(retrieval_nodes),
-            "database_results": query_results,
-            "pending_gap": [g.field_label for g in gap_batch.gaps] if gap_batch else None,
-        }
-        start = time.perf_counter()
-        capture: dict = {}
-        turn_summary = await llm.generate_turn_summary(pieces, capture=capture)
-        trace.append(
-            _trace(
-                "generate_turn_summary",
-                settings.model_question_gen,
-                str(pieces)[:200],
-                turn_summary.next_message,
-                start,
-                llm_input=capture.get("messages"),
-                llm_output=capture.get("raw_output"),
-            )
+    # generate_turn_reply runs unconditionally, exactly once per turn — it's
+    # the only place a direct answer, database results, changes, context, or
+    # the next question get turned into user-facing text, and there is never
+    # a second LLM call competing with it for that job (see module docstring).
+    # project_context (the full tree) appears exactly once here — it's
+    # rendered into the system prompt only (see prompts.build_turn_reply_system
+    # / format_project_context) and deliberately excluded from the JSON blob
+    # prompts.turn_reply_user dumps for the rest of these pieces, so the
+    # (potentially large) tree is never sent to the model twice.
+    pieces = {
+        "direct_answer_request": direct_answer_request,
+        "project_context": project_context,
+        "changes": first_action.changes if first_action else [],
+        "context_retrieval_request": context_retrieval_request,
+        "database_results": query_results,
+        "pending_gap": [g.field_label for g in gap_batch.gaps] if gap_batch else None,
+    }
+    start = time.perf_counter()
+    capture: dict = {}
+    turn_reply = await llm.generate_turn_reply(pieces, capture=capture)
+    trace.append(
+        _trace(
+            "generate_turn_reply",
+            settings.model_question_gen,
+            str(pieces)[:200],
+            turn_reply.reply,
+            start,
+            llm_input=capture.get("messages"),
+            llm_output=capture.get("raw_output"),
         )
-        writer({"type": "operation_progress", "stage": "summary", "ok": True})
-
-    answer = ""
-    if answer_future is not None:
-        answer, answer_entry = await answer_future
-        writer({"type": "operation_progress", "stage": "direct_answer", "ok": True})
-        trace.append(answer_entry)
+    )
+    writer({"type": "operation_progress", "stage": "summary", "ok": True})
 
     return {
-        "answer": answer,
-        "database_summary": turn_summary.database_summary if turn_summary else None,
-        "context_summary": turn_summary.context_summary if turn_summary else None,
-        "changes_summary": turn_summary.changes_summary if turn_summary else None,
-        # NOT "message" — GraphState["message"] is already the user's own
-        # input text for this turn (see app.chat.run_chat_turn's initial
-        # state dict); reusing that key here would silently overwrite it.
-        "next_message": turn_summary.next_message if turn_summary else None,
-        "is_question": bool(turn_summary and turn_summary.is_question),
+        "reply": turn_reply.reply,
+        "context_summary": turn_reply.context_summary,
+        "changes_summary": turn_reply.changes_summary,
+        "is_question": turn_reply.is_question,
         "pending_gap": gap_batch.model_dump() if gap_batch else None,
         "active_room_id": active_room_id,
+        "project_type_skipped": project_type_skipped,
         "complete": complete,
         "trace": trace,
     }

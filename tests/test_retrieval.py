@@ -67,10 +67,11 @@ async def test_retrieve_scoped_excludes_other_rooms_but_keeps_the_answer():
 
 
 async def test_retrieve_scoped_sends_meaningfully_fewer_tokens_than_the_whole_project():
-    """Exit criterion: token count sent to generate_answer drops measurably
-    for a context-related query. Approximated here as character count of the
-    serialized node set, same proxy app/graph.py's own retrieve_context_node
-    already uses (a joined summary string, not an actual tokenizer call)."""
+    """Exit criterion: token count sent to the turn-reply join call drops
+    measurably for a context-related query. Approximated here as character
+    count of the serialized node set, same proxy app/pipeline.py's own
+    _run_context_retrieval already uses (a joined summary string, not an
+    actual tokenizer call)."""
     project_id = "proj-retrieval-tokens"
     await _seed_multi_room_project(project_id)
 

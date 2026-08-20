@@ -59,11 +59,10 @@ async def run_chat_turn(
 
     Event shapes:
       {"type": "image_description", "content": str}
-      {"type": "token", "content": str}
       {"type": "progress", "node": str}
       {"type": "trace", "node": str, "entries": list[dict]}  # TraceEntry.model_dump() per entry
       {"type": "operation_progress", "stage": str, "ok": bool}
-      {"type": "pipeline_result", "database_summary": str|None, "context_summary": str|None, "changes_summary": str|None, "message": str, "is_question": bool}
+      {"type": "pipeline_result", "context_summary": str|None, "changes_summary": str|None, "reply": str, "is_question": bool}
       {"type": "operation_questions", "questions": list[dict]}
       # [{"op_id", "text", "question", "options": [{"id", "label", "room_ids"}, ...], "allow_custom": true}, ...]
       # The viewer must render both the option list AND a free-text input for
@@ -80,14 +79,17 @@ async def run_chat_turn(
 
     `operation_progress` fires once per pipeline stage as it completes (see
     app.pipeline.run_pipeline: first_action / context_retrieval /
-    database_query / summary / direct_answer, whichever apply this turn) —
-    finer-grained than the per-graph-node `progress` event above (which only
-    fires once for the whole `run_pipeline` node).
+    database_query / summary, whichever apply this turn) — finer-grained
+    than the per-graph-node `progress` event above (which only fires once
+    for the whole `run_pipeline` node).
 
     `pipeline_result` is the single join-step reply for this turn — replaces
-    the old separate context_updated/ask_question/wrapup events. `message`
-    is either the next question (is_question=true) or a closing/completion
-    line (is_question=false).
+    the old separate context_updated/ask_question/wrapup events, and is no
+    longer split across a streamed `token` answer plus a separate closing
+    line (see app.llm.generate_turn_reply — one LLM call now produces the
+    whole thing, not streamed token-by-token). `reply` is the turn's whole
+    conversational text, already ending on either the next question
+    (is_question=true) or a closing/completion line (is_question=false).
 
     `operation_questions` fires when classify_intent_node couldn't ground
     one or more write operations to a graph location (see the
@@ -120,6 +122,7 @@ async def run_chat_turn(
             "message": graph_message,
             "history": history,
             "skipped_rooms": list(session.skipped_rooms),
+            "project_type_skipped": session.project_type_skipped,
             "current_field": session.current_field,
             "active_room_id": session.active_room_id,
             "intent": [],
@@ -128,11 +131,9 @@ async def run_chat_turn(
             "operation_answers": operation_answers,
             "operation_room_selections": operation_room_selections,
             "pending_gap": session.pending_gap,
-            "answer": "",
-            "database_summary": None,
+            "reply": "",
             "context_summary": None,
             "changes_summary": None,
-            "next_message": None,
             "is_question": False,
             "complete": False,
             "trace": [],
@@ -175,14 +176,11 @@ async def run_chat_turn(
                 if mode is _SENTINEL:
                     break
                 if mode == "custom":
-                    # Two distinct custom-stream producers share this mode:
-                    # app.pipeline._run_direct_answer's token-by-token
-                    # streaming (chunk["type"] == "answer_token") and
                     # app.pipeline.run_pipeline's per-stage progress events
-                    # (chunk["type"] == "operation_progress").
-                    if chunk.get("type") == "answer_token":
-                        yield {"type": "token", "content": chunk["token"]}
-                    elif chunk.get("type") == "operation_progress":
+                    # (chunk["type"] == "operation_progress") — the only
+                    # custom-stream producer now that generate_turn_reply
+                    # replaces the old streamed direct-answer call.
+                    if chunk.get("type") == "operation_progress":
                         yield {
                             "type": "operation_progress",
                             "stage": chunk["stage"],
@@ -221,10 +219,9 @@ async def run_chat_turn(
         # picked option should read (e.g. "Kitchen").
         user_message_content = message or (", ".join(operation_answers.values()) if operation_answers else message)
         session.messages.append(Message(role="user", content=user_message_content))
-        if final_state["answer"]:
-            session.messages.append(Message(role="assistant", content=final_state["answer"]))
 
         session.skipped_rooms = final_state.get("skipped_rooms", session.skipped_rooms)
+        session.project_type_skipped = final_state.get("project_type_skipped", session.project_type_skipped)
         session.current_field = final_state.get("current_field", session.current_field)
         session.active_room_id = final_state.get("active_room_id", session.active_room_id)
         session.trace.extend(final_state["trace"])
@@ -234,20 +231,24 @@ async def run_chat_turn(
         session.status = "complete" if final_state.get("complete") else "in_progress"
 
         # The pipeline's single join-step reply — replaces the old separate
-        # context_updated/ask_question/wrapup events. next_message is either
-        # the next question (is_question=true) or a closing/completion line
+        # context_updated/ask_question/wrapup events, and the old separate
+        # streamed DIRECT_ANSWER message. `reply` is either the next
+        # question (is_question=true) or a closing/completion line
         # (is_question=false); either way it's the one thing to show the
-        # user beyond a DIRECT_ANSWER's own streamed answer.
-        next_message = final_state.get("next_message")
+        # user this turn.
+        reply = final_state.get("reply")
         is_question = final_state.get("is_question", False)
-        if next_message:
-            session.messages.append(Message(role="assistant", content=next_message))
+        if reply:
+            context_summary = final_state.get("context_summary")
+            changes_summary = final_state.get("changes_summary")
+            session.messages.append(
+                Message(role="assistant", content=reply, context_summary=context_summary, changes_summary=changes_summary)
+            )
             yield {
                 "type": "pipeline_result",
-                "database_summary": final_state.get("database_summary"),
-                "context_summary": final_state.get("context_summary"),
-                "changes_summary": final_state.get("changes_summary"),
-                "message": next_message,
+                "context_summary": context_summary,
+                "changes_summary": changes_summary,
+                "reply": reply,
                 "is_question": is_question,
             }
 
@@ -255,7 +256,7 @@ async def run_chat_turn(
         # an ordinary knowledge-gap question (run_pipeline) are mutually
         # exclusive by construction — pending_operation_questions only ever
         # comes from the short-circuit branch that never reaches
-        # run_pipeline, so next_message is always empty on that branch.
+        # run_pipeline, so reply is always empty on that branch.
         pending_operation_questions = final_state.get("pending_operation_questions")
         if pending_operation_questions and session.status == "in_progress":
             for q in pending_operation_questions["questions"]:
@@ -272,7 +273,7 @@ async def run_chat_turn(
 
         await save_session(session)
 
-        root_span.update(output=final_state.get("answer") or next_message or "")
+        root_span.update(output=reply or "")
         yield {"type": "done", "session_id": session.session_id, "status": session.status}
 
 

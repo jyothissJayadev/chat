@@ -13,6 +13,15 @@ def utcnow() -> datetime:
 class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: str
+    # Only ever set on an assistant message produced by
+    # app.llm.generate_turn_reply's join step — the markdown tables that
+    # accompany `content` (the conversational reply) for that same turn, kept
+    # as their own fields rather than concatenated into `content` so the
+    # viewer can render/style them separately. None for every user message
+    # and for an assistant message with nothing to report (a plain reply/
+    # question with no changes or context this turn).
+    context_summary: Optional[str] = None
+    changes_summary: Optional[str] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -84,6 +93,11 @@ class ChatSession(Document):
     # app.graph.classify_intent_node's decline-detection step and
     # app.question_engine.find_knowledge_gap's two-pass breadth-first walk.
     skipped_rooms: list[str] = Field(default_factory=list)
+    # ProjectType is asked at most once, not held as a blocking gap — only
+    # room existence is truly mandatory. Set True by app.pipeline.run_pipeline
+    # the turn after ProjectType was the pending question, whether or not the
+    # user actually answered it (see app.question_engine.find_knowledge_gaps).
+    project_type_skipped: bool = False
     # {"canonical_path", "room_id"} for the field the LAST question was
     # about — written only by app.graph.generate_question_node, read only by
     # classify_intent_node. Dialogue mechanics, not a project fact, so it

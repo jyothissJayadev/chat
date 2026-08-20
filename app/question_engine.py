@@ -21,9 +21,9 @@ app.context_builder.detect_conflicts for critical-tier overwrite conflicts).
 find_knowledge_gaps() returns a KnowledgeGapBatch — every open field for one
 room at once, not one field per turn. Unlike the pre-cutover version of this
 module, there is no generate_question() LLM call here anymore — the
-pipeline's final turn-summary call (app.llm.generate_turn_summary) phrases
-the next question itself from a batch's gaps, so a separate LLM round trip
-per question is no longer needed."""
+pipeline's final join call (app.llm.generate_turn_reply) phrases the next
+question itself from a batch's gaps, so a separate LLM round trip per
+question is no longer needed."""
 
 from typing import Optional
 
@@ -69,7 +69,10 @@ class KnowledgeGapBatch(BaseModel):
 
 
 async def find_knowledge_gaps(
-    project_id: str, active_room_id: Optional[str] = None, skipped_rooms: Optional[list[str]] = None
+    project_id: str,
+    active_room_id: Optional[str] = None,
+    skipped_rooms: Optional[list[str]] = None,
+    project_type_skipped: bool = False,
 ) -> Optional[KnowledgeGapBatch]:
     """The turn's whole "what's still missing" answer, batched per scope
     instead of one field at a time. Room fields are the actual fix here: all
@@ -102,7 +105,11 @@ async def find_knowledge_gaps(
         # is the only "open" signal.
         return node is None or node.value is None
 
-    if _is_open("Project.BasicInformation.ProjectType"):
+    # Not blocking: only room existence is truly mandatory (see
+    # ChatSession.project_type_skipped). Asked once; if it's still open on a
+    # later turn, project_type_skipped is already True by the time we get
+    # here and this is skipped for good.
+    if not project_type_skipped and _is_open("Project.BasicInformation.ProjectType"):
         return KnowledgeGapBatch(
             gaps=[
                 KnowledgeGap(

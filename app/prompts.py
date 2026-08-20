@@ -8,6 +8,8 @@ that interpolates per-call data (context dicts, history, retrieved anchors)
 is a small function returning the assembled string.
 """
 
+import json
+
 # ---------------------------------------------------------------------------
 # classify_operations
 #
@@ -59,6 +61,8 @@ Never treat information from CURRENT DATA TREE as if the user stated it in the c
 CONNECTION — DECISION PROCEDURE
 
 Every operation must have exactly one connection value. Work through these steps IN ORDER for each operation and stop at the first one that applies. Do not skip straight to a familiar-looking example — walk the steps.
+
+connection is always one of: the literal string "Project"; a normalized new room/entity name in plain words (e.g. "Kitchen", "TV Unit"); an EXACT canonical path built only from segments that literally appear in CURRENT DATA TREE, copied character-for-character (e.g. "Rooms.a1b2c3d4.Furniture.sofa"); or null. Every id inside a path (the part after "Rooms.") must be a real id you copied from the tree — never a placeholder, a variable name, a template token like "<room_id>" or "<living_room_id>", or anything in angle brackets. If you don't have a real id from the tree to put there, you don't have a resolved path — use connection = null (or the Step 2 new-room name) instead of inventing or templating one. connection is also never a sentence or an "X or Y if Z" explanation — it is always the single bare value itself; put any reasoning about why in the `reasoning` field, not inside `connection`.
 
 STEP 1 — Does the operation clearly refer to a SPECIFIC entity that already exists in CURRENT DATA TREE (by name, synonym, or reference word like "it"/"that"/"the island")?
   → YES, and exactly one entity matches: connection = that entity's exact canonical path.
@@ -266,11 +270,14 @@ Tree: no living room exists yet.
 
 Example I — hedge that looks like a fork but isn't (NOT confusion)
 
+Tree:
+Rooms.a1b2c3d4
+    RoomType = "kitchen"
+(no cabinet yet)
+
 User: "The kitchen should have white or light-coloured cabinets."
 
-Tree: kitchen exists, no cabinet yet.
-
-→ connection = "Rooms.<kitchen_id>"
+→ connection = "Rooms.a1b2c3d4"
 → confusion = false — "white or light-coloured" is a compatible range (white is a light colour); saving "white or light-coloured" as the value is fully actionable. Contrast with Example H, where "large" and "minimal/none" are not compatible — they're different furniture plans.
 
 Example J — location ambiguity, NOT confusion
@@ -382,21 +389,31 @@ This applies even when the SAME material/item/action is repeated across differen
 
 Example:
 
+Tree:
+Rooms.a1b2c3d4   RoomType = "Living Room"   Furniture.tv_unit
+Rooms.e5f6a7b8   RoomType = "Bedroom"   (empty)
+
 "Add laminate to the TV unit in the living room and the wardrobe in the bedroom."
 
 → TWO CONTEXT_UPDATE operations, each with its own connection:
 
-{"text": "Add laminate to the TV unit", "intent": "CONTEXT_UPDATE", "connection": "Rooms.<living_room_id>.Furniture.tv_unit or Rooms.<living_room_id> if the TV unit does not yet exist", "confusion": false}
-{"text": "Add laminate to the wardrobe", "intent": "CONTEXT_UPDATE", "connection": "Rooms.<bedroom_id>.Furniture.wardrobe or Rooms.<bedroom_id> if the wardrobe does not yet exist", "confusion": false}
+{"text": "Add laminate to the TV unit", "intent": "CONTEXT_UPDATE", "connection": "Rooms.a1b2c3d4.Furniture.tv_unit", "confusion": false}
+{"text": "Add laminate to the wardrobe", "intent": "CONTEXT_UPDATE", "connection": "Rooms.e5f6a7b8", "confusion": false}
+
+(The TV unit already exists under the living room, so connection is its own exact path — Step 2's edit branch. The wardrobe does not exist yet under the bedroom, so connection is the bedroom's own path instead — Step 2's new-item branch; the downstream system creates the wardrobe there. Two different outcomes for the same phrasing "add X to room Y" — resolve each independently against the tree rather than reusing one pattern for both, and never combine both outcomes into one connection string like "path A or path B if not found".)
 
 Example:
+
+Tree:
+Rooms.b2c3d4e5   RoomType = "Bedroom"   (empty)
+Rooms.c3d4e5f6   RoomType = "Bedroom"   (empty)
 
 "Add laminate flooring to both bedrooms."
 
 → TWO CONTEXT_UPDATE operations, one per explicitly named room, same item text repeated in each:
 
-{"text": "Add laminate flooring", "intent": "CONTEXT_UPDATE", "connection": "Rooms.<bedroom_1_id>", "confusion": false}
-{"text": "Add laminate flooring", "intent": "CONTEXT_UPDATE", "connection": "Rooms.<bedroom_2_id>", "confusion": false}
+{"text": "Add laminate flooring", "intent": "CONTEXT_UPDATE", "connection": "Rooms.b2c3d4e5", "confusion": false}
+{"text": "Add laminate flooring", "intent": "CONTEXT_UPDATE", "connection": "Rooms.c3d4e5f6", "confusion": false}
 
 Never merge multiple rooms/entities into a single operation's connection. A connection is always exactly one room, one entity, "Project", or null — never a list.
 
@@ -443,7 +460,7 @@ Before output, internally verify:
 - Every meaningful part of the user's message is represented.
 - No requirement, question, constraint, preference, number, material, room, or instruction was dropped.
 - Every operation has exactly one intent.
-- Every existing target uses its exact canonical graph path.
+- Every existing target uses its exact canonical graph path, with every id in it copied verbatim from CURRENT DATA TREE — never a placeholder/template token (e.g. "<room_id>", "<living_room_id>") and never explanatory prose folded into the connection string.
 - Multiple structural matches were checked against the STEP 1 TIE-BREAKER before defaulting to null.
 - No edit/delete operation falls back to a parent room when its target cannot be resolved.
 - New items use their room path only when they are explicitly being added/created — including when the room is named as a compound noun, not only as a prepositional phrase, and including STEP 2B's conventional-item match when no room was named at all.
@@ -1028,236 +1045,385 @@ def resolve_context_confusion_user() -> str:
 # substitution (not str.format — the OUTPUT JSON examples below contain
 # literal unescaped braces).
 # ---------------------------------------------------------------------------
-RESOLVE_CONTEXT_CHANGES_SYSTEM_TEMPLATE = """You are the context-change resolver for an interior-design project assistant.
+RESOLVE_CONTEXT_CHANGES_SYSTEM_TEMPLATE = """You are the Context Change Resolver for an interior-design project graph.
 
-You are given a batch of operations, each already classified as CONTEXT_UPDATE or CONTEXT_DELETE and already assigned a `connection` (the graph location it applies to — an exact existing path, a new room name, or "Project"). By the time you receive an operation, `connection` is always resolved — it is never null here. You do NOT decide intent or connection — those are already fixed. Your job is ONLY to work out, for each operation:
+Your job is to convert each already-classified operation into a precise graph-write instruction.
 
-- CONTEXT_UPDATE: which structured fields it states values for, and which freeform entities (materials, furniture, attributes, constraints, client preferences) it mentions.
-- CONTEXT_DELETE: which existing node(s) in CURRENT DATA TREE it removes — as exact canonical paths, copied verbatim from the tree. Never invent a path. If no confident target exists in the tree for this operation, return an empty list rather than guessing.
+IMPORTANT:
+- Intent and connection are already resolved upstream.
+- NEVER change, reinterpret, or question intent or connection.
+- Process every operation independently.
+- Do not use information from one operation to complete another.
+- Do not invent facts, paths, entities, or values.
 
 ==================================================
-CURRENT DATA TREE
+INPUT
 ==================================================
 
+CURRENT DATA TREE:
 {{current_data_tree}}
 
-==================================================
-OPERATIONS
-==================================================
-
+OPERATIONS:
 {{operations}}
 
 Each operation has:
 {
-  "id": "op_1",
   "text": "...",
   "intent": "CONTEXT_UPDATE | CONTEXT_DELETE",
-  "connection": "exact canonical path | new room name | Project"
+  "connection": "exact existing path | new room name | Project"
 }
 
-==================================================
-RULES
-==================================================
+There is NO id field.
 
-1. Process EVERY operation independently and return exactly one result per operation, matched by `id` — not by position in the list. Copy `id`, `text`, and `intent` back verbatim from the input operation onto its result.
+POSITIONAL CONTRACT:
+If there are N operations, return exactly N results.
+results[0] corresponds to operations[0].
+results[1] corresponds to operations[1].
+Continue in exactly the same order.
 
-2. For CONTEXT_UPDATE: fill `fields` with any structured values this operation's own text states (never values from CURRENT DATA TREE, never values belonging to a DIFFERENT operation). `projectType`/`overallBudget`/`timeline` only apply when `connection` is "Project" — never set them for a room-scoped operation. `budgetOrRequirement`/`style`/`squareFootage`/`existingFurniture`/`materials` only apply to a room-scoped operation. A hedged or approximate statement ("maybe around 4 lakh", "roughly 300 sqft") still counts as stated — keep the hedge wording, don't leave it null.
-
-3. For CONTEXT_UPDATE, if the operation's text is EDITING an entity that already appears in CURRENT DATA TREE — not introducing something new — add a `freeform_entities` entry with `existing_path` set to that entity's exact canonical path, copied verbatim from the tree, and `field`+`value` set to the one specific leaf being changed (one of Label/Material/Specification/Quantity/Notes — whichever the entity's own node type in the tree actually shows). Only set `existing_path` when you can confidently match the operation's wording to a SPECIFIC entity already shown in the tree — if you're not confident it's the same thing, leave `existing_path`/`field`/`value` all null instead and treat it as a new mention (rule 4). Never guess a path. NOTE: editing an existing entity can also mean attaching a NEW part to it (rule 9) — in that case `existing_path` is set to the parent entity but `field`/`value` are left null and the new part goes in `parts`.
-
-4. For CONTEXT_UPDATE, anything mentioned that ISN'T a structured field (rule 2) and ISN'T a confident edit to an existing entity (rule 3) is a NEW freeform entity — one entry per distinct thing, `raw_entity` in the user's own wording, `existing_path`/`field`/`value` left null.
-
-EXCEPTION: if the operation's own `connection` is a new room name (not an exact canonical path, not "Project"), the room itself is already being created elsewhere from `connection` — do NOT also emit a freeform_entities mention whose `raw_entity` is that same room name (or a close paraphrase of it, e.g. "the living room" for connection "Living Room"). An operation that does nothing but name the room being created (e.g. "Add living room", "add a kitchen") has NOTHING left to extract — return it with empty `fields` and an empty `freeform_entities` list. Only emit a freeform_entities mention for something ELSE the operation states about that room (a material, a piece of furniture, a style, a requirement) — never for the room's own name.
-
-5. For CONTEXT_DELETE: `deletion_targets` must be exact canonical paths that literally appear in CURRENT DATA TREE — copy them character-for-character. If the operation's own `connection` is already an exact existing path, that path is usually the right (and often only) deletion target. If the operation clearly means an entire room, its room-level path is a valid deletion target (deleting a room retracts everything under it). Never fabricate a path that isn't in the tree.
-
-6. Never fill `fields`/`freeform_entities` on a CONTEXT_DELETE result, and never fill `deletion_targets` on a CONTEXT_UPDATE result.
-
-7. Do not invent information. If an operation's text doesn't clearly state a value, leave that field null rather than guessing.
-
-8. Every input operation must produce exactly one output result with a matching `id`. Never omit an operation, never emit a result whose `id` doesn't correspond to one in the input, and never emit two results for the same `id`.
-
-9. COMPOSITE ENTITIES — parts, properties, and quantity. When the user describes a freeform entity together with sub-components attached TO it, or named key/value attributes of it, or a count of it, capture that structure on the ONE `freeform_entities` entry for the parent entity — do NOT split the sub-components into separate sibling mentions.
-
-   - `parts`: a physical sub-component the user attaches to the entity. "add a bedcover to the bed" (connection = the bed's path) -> ONE mention with `existing_path` = the bed's path, `field`/`value` null, and `parts` = [{"raw_entity": "bedcover"}]. "add a sofa with a velvet cover and two pillows" (connection = a room) -> ONE mention for the sofa (new, `existing_path` null) with `parts` = [{"raw_entity": "velvet cover", "material": "velvet"}, {"raw_entity": "pillows", "quantity": "2"}]. The part attaches to the entity the operation is about — when `connection` points at an existing instance deeper than Rooms.<id>, parts attach to THAT instance; otherwise they attach to the mention's own entity.
-
-   - `properties`: a named key/value attribute of the entity that isn't one of the typed leaf fields (Label/Material/Specification/Notes). "red sofa" -> properties = [{"name": "color", "value": "red"}]. "velvet cover" (cover as a part) -> that's a part with material="velvet" OR a part with properties=[{"name": "material", "value": "velvet"}] — prefer `material` on the part when the wording is a material/finish, use `properties` for anything else (color, finish, fabric, style). Never duplicate a property as both a typed field and a properties entry.
-
-   - `quantity`: a COUNT the user stated for the entity or part, as a STRING. "two pillows" -> "2". "three beds" -> "3". Leave null when no count was given. A hedge like "a couple of" still counts — use "2".
-
-   - ONE LEVEL ONLY: `parts` entries must NOT themselves contain a `parts` list (the schema does not allow it). If the user describes a sub-component of a part ("pillow with a removable cover"), fold the inner detail into the part's own `properties`/`quantity`/`material` — never nest further. A part is always a direct child of the parent entity, never of another part.
-
-   - Do NOT emit a `parts`/`properties` entry for something that is already the entity's own name or the room's own name (rule 4's exception applies at every level). "add a bed" does not get a part called "bed".
-
-   - When `connection` is a new room name and the operation only names the room, `parts`/`properties`/`quantity` are all empty (same as rule 4's exception).
+Never merge, split, skip, duplicate, or reorder operations.
 
 ==================================================
-EXAMPLE — editing an existing entity vs. a new one
+CONNECTION RULES
 ==================================================
 
-TREE (excerpt):
+Treat connection as authoritative.
 
-Rooms.a1b2c3d4
-└── Furniture.sofa
-    Label="sofa", Material="fabric"
+1. EXISTING PATH
+If connection is an exact path from CURRENT DATA TREE:
+- It is the primary target of the operation.
+- When the operation modifies or adds something to that entity, use existing_path = connection.
+- Never replace it with another path.
 
-OPERATIONS: [{"id": "op_1", "text": "change the sofa material to leather", "intent": "CONTEXT_UPDATE", "connection": "Rooms.a1b2c3d4.Furniture.sofa"}]
+2. NEW ROOM NAME
+If connection is a bare room name such as "Kitchen" or "Master Bedroom":
+- The room itself is already being created elsewhere.
+- NEVER create that room as a freeform entity.
+- Extract only additional information stated about the room.
 
-OUTPUT:
+Example:
+"add kitchen"
+→ nothing to extract.
+
+"add kitchen with modern style"
+→ style = "modern".
+
+"add kitchen with a wooden dining table"
+→ freeform entity = "wooden dining table".
+
+3. PROJECT
+If connection is "Project", only project-scoped information may populate project fields.
+
+==================================================
+CONTEXT_UPDATE
+==================================================
+
+Extract ONLY information explicitly stated in the operation text.
+
+FIELDS:
+
+Project-scoped:
+- projectType
+- overallBudget
+- timeline
+
+Room-scoped:
+- roomType
+- budgetOrRequirement
+- style
+- squareFootage
+- existingFurniture
+- materials
+
+Scope rules:
+- Project fields are allowed only when connection = "Project".
+- Room fields are allowed for room connections.
+- Do not copy values from CURRENT DATA TREE unless the operation explicitly states them.
+- Approximate/hedged values still count as stated. Preserve the user's wording.
+
+ROOM TYPE:
+Use fields.roomType only when the operation changes/refines the type of an EXISTING room.
+
+Example:
+connection = "Rooms.abc123"
+"change bedroom to master bedroom"
+→ roomType = "master bedroom"
+
+Do NOT represent an existing room rename as a freeform entity or Label edit.
+
+==================================================
+FREEFORM ENTITIES
+==================================================
+
+Anything explicitly mentioned that is not a structured field becomes a freeform entity.
+
+For each entity:
+
+{
+  "raw_entity": "...",
+  "node_type_hint": "Materials | Furniture | Attributes | Constraints | ClientPreferences | null",
+  "existing_path": "exact path | null",
+  "field": "Label | Material | Specification | Quantity | Notes | null",
+  "value": "... | null",
+  "quantity": "... | null",
+  "properties": [],
+  "parts": []
+}
+
+EXISTING ENTITY EDIT:
+If the operation modifies an entity already present in CURRENT DATA TREE:
+- use its exact existing path;
+- copy the path character-for-character;
+- use field + value for the specific changed leaf.
+
+Allowed fields:
+Label, Material, Specification, Quantity, Notes.
+
+`field` is ONLY for these five typed leaves, and `Specification` is legal on a Materials entity only — never on Furniture, Attributes, Constraints, ClientPreferences, or a Part. A descriptive, open-ended attribute (color, finish, shape, fabric, style, or anything else not in that fixed list) is NEVER a `field`, on a new entity OR an existing one — it always goes in `properties` instead (see PROPERTIES below), even while `existing_path` is set. If the operation only changes such an attribute, leave field and value null and add the property to `properties` on this same mention.
+
+Example:
+Tree: Rooms.abc123.Furniture.sofa, Label="sofa" (already exists)
+"lets make the sofa red in color"
+→ existing_path = "Rooms.abc123.Furniture.sofa", field = null, value = null,
+  properties = [{"name": "color", "value": "red"}]
+(NOT field="Specification" — Specification isn't legal for Furniture, and color was never one of the five typed leaves to begin with, existing entity or not.)
+
+If connection is already the exact path of the entity being modified, use:
+existing_path = connection.
+
+Never guess a path. If an existing entity cannot be confidently identified, treat it as a new mention.
+
+NEW ENTITY:
+If the entity does not confidently exist in the tree:
+- existing_path = null
+- field = null
+- value = null
+- preserve the user's wording in raw_entity.
+
+==================================================
+COMPOSITE ENTITIES
+==================================================
+
+Keep one real-world parent entity together.
+
+Example:
+"add a red sofa with a velvet cover and two pillows"
+
+ONE entity:
+sofa
+- property: color = red
+- part: velvet cover, material = velvet
+- part: pillows, quantity = "2"
+
+Do NOT create sofa, cover, and pillows as unrelated sibling entities.
+
+PROPERTIES:
+Use properties for attributes such as color, finish, shape, fabric, style, etc. — same rule whether the entity is brand new or already exists in the tree (existing_path set, field/value left null, the attribute still goes in properties, never in field). See the color example under EXISTING ENTITY EDIT above.
+
+PARTS:
+Use parts for physical components attached to the parent entity.
+
+QUANTITY:
+Store stated counts as strings:
+"two pillows" → "2"
+"three beds" → "3"
+"a couple of chairs" → "2"
+
+A part has:
+{
+  "raw_entity": "...",
+  "material": "... | null",
+  "quantity": "... | null",
+  "properties": [],
+  "existing_path": null,
+  "field": null,
+  "value": null
+}
+
+Parts may NOT contain another parts list.
+
+If an existing entity receives a new component:
+"add a bedcover to the bed"
+→ parent entity = existing bed
+→ bedcover goes inside parent.parts
+→ do not create bedcover as a sibling entity.
+
+==================================================
+CONTEXT_DELETE
+==================================================
+
+For CONTEXT_DELETE:
+
+- fields must contain only null values.
+- freeform_entities must be [].
+- deletion_targets must contain only exact paths that literally exist in CURRENT DATA TREE.
+- Copy paths character-for-character.
+- If connection is an existing exact path and the operation deletes that target, use connection.
+- If no confident existing path can be identified, return [].
+- NEVER invent a deletion path.
+
+==================================================
+NO INVENTION
+==================================================
+
+Never infer unstated information.
+
+Do not:
+- copy unrelated tree values;
+- infer missing materials, styles, quantities, budgets, etc.;
+- create paths;
+- convert room names into freeform entities;
+- create duplicate entities when an existing entity is clearly identified;
+- merge separate operations.
+
+The CURRENT DATA TREE is used primarily to identify existing entities and validate paths. It is NOT a source of new user facts.
+
+==================================================
+OUTPUT CONTRACT
+==================================================
+
+Return ONLY this JSON structure:
+
 {
   "results": [
     {
-      "id": "op_1",
-      "text": "change the sofa material to leather",
-      "intent": "CONTEXT_UPDATE",
-      "fields": {"projectType": null, "overallBudget": null, "timeline": null, "budgetOrRequirement": null, "style": null, "squareFootage": null, "existingFurniture": null, "materials": null},
-      "freeform_entities": [
-        {"raw_entity": "sofa", "node_type_hint": null, "existing_path": "Rooms.a1b2c3d4.Furniture.sofa", "field": "Material", "value": "leather"}
-      ],
-      "deletion_targets": []
-    }
-  ]
-}
-
-(The sofa already exists in the tree, so this is an edit — existing_path points at it directly instead of creating a second sofa. A mention of something NOT in the tree, e.g. "add a walnut TV cabinet", would instead use {"raw_entity": "TV cabinet", "node_type_hint": "Furniture", "existing_path": null, "field": null, "value": null}.)
-
-==================================================
-EXAMPLE — an operation that only names the new room being created
-==================================================
-
-TREE (excerpt): empty project, no rooms yet.
-
-OPERATIONS: [{"id": "op_2", "text": "Add living room", "intent": "CONTEXT_UPDATE", "connection": "Living Room"}]
-
-OUTPUT:
-{
-  "results": [
-    {
-      "id": "op_2",
-      "text": "Add living room",
-      "intent": "CONTEXT_UPDATE",
-      "fields": {"projectType": null, "overallBudget": null, "timeline": null, "budgetOrRequirement": null, "style": null, "squareFootage": null, "existingFurniture": null, "materials": null},
+      "text": "...",
+      "intent": "CONTEXT_UPDATE | CONTEXT_DELETE",
+      "fields": {
+        "projectType": null,
+        "overallBudget": null,
+        "timeline": null,
+        "roomType": null,
+        "budgetOrRequirement": null,
+        "style": null,
+        "squareFootage": null,
+        "existingFurniture": null,
+        "materials": null
+      },
       "freeform_entities": [],
       "deletion_targets": []
     }
   ]
 }
 
-(`connection` is "Living Room" — a new room name, not an exact path — so the room creation itself is already handled elsewhere. "living room" is NOT a material/furniture/attribute mention; the operation states nothing beyond the room's own name, so both `fields` and `freeform_entities` come back empty — rule 4's exception. Contrast with "Add a living room with a walnut TV unit", where `freeform_entities` would carry ONE entry for "walnut TV unit" — the room name itself is still never turned into a mention.)
+Every result MUST contain exactly these five top-level keys:
+text, intent, fields, freeform_entities, deletion_targets.
+
+For CONTEXT_UPDATE:
+- deletion_targets = []
+
+For CONTEXT_DELETE:
+- all fields = null
+- freeform_entities = []
+- deletion_targets = [] or exact existing paths
 
 ==================================================
-EXAMPLE — composite entity: adding a part to an existing item
+EXAMPLE — MULTIPLE OPERATIONS
 ==================================================
 
-TREE (excerpt):
+CURRENT DATA TREE:
+Project
+└── Rooms
+    └── abc123
+        └── RoomType = "Living Room"
 
-Rooms.c785b3b6
-└── Furniture.beds
-    Label="beds"
-
-OPERATIONS: [{"id": "op_3", "text": "add a bedcover to the bed in the bedroom", "intent": "CONTEXT_UPDATE", "connection": "Rooms.c785b3b6.Furniture.beds"}]
+OPERATIONS:
+[
+  {
+    "text": "Add a kitchen",
+    "intent": "CONTEXT_UPDATE",
+    "connection": "Kitchen"
+  },
+  {
+    "text": "Add a bedroom",
+    "intent": "CONTEXT_UPDATE",
+    "connection": "Bedroom"
+  },
+  {
+    "text": "Add a bathroom",
+    "intent": "CONTEXT_UPDATE",
+    "connection": "Bathroom"
+  }
+]
 
 OUTPUT:
 {
   "results": [
     {
-      "id": "op_3",
-      "text": "add a bedcover to the bed in the bedroom",
+      "text": "Add a kitchen",
       "intent": "CONTEXT_UPDATE",
-      "fields": {"projectType": null, "overallBudget": null, "timeline": null, "budgetOrRequirement": null, "style": null, "squareFootage": null, "existingFurniture": null, "materials": null},
-      "freeform_entities": [
-        {"raw_entity": "beds", "node_type_hint": null, "existing_path": "Rooms.c785b3b6.Furniture.beds", "field": null, "value": null, "quantity": null, "properties": [], "parts": [
-          {"raw_entity": "bedcover", "material": null, "quantity": null, "properties": [], "existing_path": null, "field": null, "value": null}
-        ]}
-      ],
-      "deletion_targets": []
-    }
-  ]
-}
-
-(`connection` points at the existing bed instance, so the bedcover is a PART of it — `parts` on the bed's mention, NOT a sibling Furniture mention. `existing_path` is the bed's path (the entity being added TO); `field`/`value` are null because no leaf of the bed itself is being changed. The bedcover creates a new Parts child under the bed downstream. Contrast with "change the bed's material to oak", which is a leaf edit — `field`="Material", `value`="oak", `parts` empty.)
-
-==================================================
-EXAMPLE — composite entity: a new item with parts, properties, and quantity
-==================================================
-
-TREE (excerpt): empty room Rooms.a1b2c3d4.
-
-OPERATIONS: [{"id": "op_4", "text": "add a red sofa with the velvet cover and two pillows on top of this", "intent": "CONTEXT_UPDATE", "connection": "Rooms.a1b2c3d4"}]
-
-OUTPUT:
-{
-  "results": [
-    {
-      "id": "op_4",
-      "text": "add a red sofa with the velvet cover and two pillows on top of this",
-      "intent": "CONTEXT_UPDATE",
-      "fields": {"projectType": null, "overallBudget": null, "timeline": null, "budgetOrRequirement": null, "style": null, "squareFootage": null, "existingFurniture": null, "materials": null},
-      "freeform_entities": [
-        {"raw_entity": "sofa", "node_type_hint": "Furniture", "existing_path": null, "field": null, "value": null, "quantity": null, "properties": [
-          {"name": "color", "value": "red"}
-        ], "parts": [
-          {"raw_entity": "velvet cover", "material": "velvet", "quantity": null, "properties": [], "existing_path": null, "field": null, "value": null},
-          {"raw_entity": "pillows", "material": null, "quantity": "2", "properties": [], "existing_path": null, "field": null, "value": null}
-        ]}
-      ],
-      "deletion_targets": []
-    }
-  ]
-}
-
-(The sofa is new, so it's one mention with `existing_path` null. "red" is a property (color), not a typed field. "velvet cover" is a part whose material is velvet. "two pillows" is a part with quantity "2". All three sub-things attach to the sofa, never as separate sibling Furniture mentions. ONE LEVEL ONLY: if the pillows themselves "had a removable cover", that would go on the pillows part as a property, never as a nested part.)
-
-==================================================
-OUTPUT
-==================================================
-
-Return ONLY valid JSON:
-
-{
-  "results": [
-    {
-      "id": "...",
-      "text": "...",
-      "intent": "CONTEXT_UPDATE | CONTEXT_DELETE",
       "fields": {
-        "projectType": null, "overallBudget": null, "timeline": null,
-        "budgetOrRequirement": null, "style": null, "squareFootage": null,
-        "existingFurniture": null, "materials": null
+        "projectType": null,
+        "overallBudget": null,
+        "timeline": null,
+        "roomType": null,
+        "budgetOrRequirement": null,
+        "style": null,
+        "squareFootage": null,
+        "existingFurniture": null,
+        "materials": null
       },
-      "freeform_entities": [
-        {
-          "raw_entity": "...",
-          "node_type_hint": "Materials | Furniture | Attributes | Constraints | ClientPreferences | null",
-          "existing_path": "exact.canonical.path | null",
-          "field": "Label | Material | Specification | Quantity | Notes | null",
-          "value": "... | null",
-          "quantity": "... | null",
-          "properties": [
-            {"name": "...", "value": "..."}
-          ],
-          "parts": [
-            {
-              "raw_entity": "...",
-              "material": "... | null",
-              "quantity": "... | null",
-              "properties": [
-                {"name": "...", "value": "..."}
-              ],
-              "existing_path": "exact.canonical.path | null",
-              "field": "Label | Material | Quantity | Notes | null",
-              "value": "... | null"
-            }
-          ]
-        }
-      ],
-      "deletion_targets": ["exact.canonical.path"]
+      "freeform_entities": [],
+      "deletion_targets": []
+    },
+    {
+      "text": "Add a bedroom",
+      "intent": "CONTEXT_UPDATE",
+      "fields": {
+        "projectType": null,
+        "overallBudget": null,
+        "timeline": null,
+        "roomType": null,
+        "budgetOrRequirement": null,
+        "style": null,
+        "squareFootage": null,
+        "existingFurniture": null,
+        "materials": null
+      },
+      "freeform_entities": [],
+      "deletion_targets": []
+    },
+    {
+      "text": "Add a bathroom",
+      "intent": "CONTEXT_UPDATE",
+      "fields": {
+        "projectType": null,
+        "overallBudget": null,
+        "timeline": null,
+        "roomType": null,
+        "budgetOrRequirement": null,
+        "style": null,
+        "squareFootage": null,
+        "existingFurniture": null,
+        "materials": null
+      },
+      "freeform_entities": [],
+      "deletion_targets": []
     }
   ]
 }
 
-No markdown. No explanations. No additional fields. """
+==================================================
+FINAL VALIDATION BEFORE RETURNING
+==================================================
 
+Before producing JSON, verify:
+
+1. Number of results == number of operations.
+2. Results are in exactly the same order.
+3. No operation was merged, skipped, duplicated, or split.
+4. Every result has exactly five top-level keys.
+5. Every fields object has exactly the nine defined fields.
+6. Every existing_path exists verbatim in CURRENT DATA TREE.
+7. Every deletion target exists verbatim in CURRENT DATA TREE.
+8. New room names are not emitted as freeform entities.
+9. CONTEXT_DELETE contains no update data.
+10. No unstated information was invented.
+11. Parts contain no nested parts.
+12. Return valid JSON only.
+
+Return the JSON object now.
+"""
 def resolve_context_changes_system(tree_text: str, operations_json: str) -> str:
     return (
         RESOLVE_CONTEXT_CHANGES_SYSTEM_TEMPLATE
@@ -1301,63 +1467,243 @@ def search_keywords_user(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# generate_turn_summary
+# generate_turn_reply — the pipeline's single join step (see
+# app.pipeline.run_pipeline). One call folds whichever pieces this turn
+# actually produced — a direct answer, database results, changes made,
+# context retrieved, the next open field — into the turn's one `reply`.
+# Replaces the old two-call split (generate_turn_summary for the tables/
+# next_message, generate_answer streamed separately for direct answers) —
+# see the TURN_REPLY_SYSTEM merge plan. build_turn_reply_system assembles the
+# system prompt from only the blocks this turn's pieces actually need, so a
+# turn with no database results never even sees DATABASE_BLOCK's
+# instructions.
 # ---------------------------------------------------------------------------
-TURN_SUMMARY_SYSTEM = """You are a senior interior designer, briefing a junior designer who is running a client intake conversation.
 
-You are given whichever of these pieces actually happened this turn: changes just made to the project (with old/new values), context just retrieved from the project, database/catalog search results, and the next open field(s) still needed (if any).
+TURN_REPLY_PREAMBLE = """You are a senior interior designer, personally continuing a live conversation with a client
+during their project intake. Everything you write goes directly to the client in your own
+voice — warm, direct, conversational, the way an experienced designer who genuinely enjoys
+their clients would talk. Never a form, never labeled sections, never a bulleted list — except
+inside the table fields described later, which are separate from your conversational reply.
 
-You produce four separate outputs. Each has a distinct job — do not blend them:
+You're given whichever of the following pieces actually happened or matter this turn. Only
+the sections below that apply to this specific turn are included — if a section isn't here,
+that piece didn't happen, and you should not mention or imply it.
 
-1. `changes_summary` — a MARKDOWN TABLE covering every entry in `changes`, or null if `changes` is empty. See CHANGES TABLE below.
-2. `context_summary` — a MARKDOWN TABLE covering every entry in `context_retrieval`, or null if `context_retrieval` is empty. See CONTEXT TABLE below.
-3. `database_summary` — a short natural-language paragraph describing `database_results`, or null if empty. NOT a table — describe what was found the way a designer would relay search results to a colleague, in plain professional language.
-4. `next_message` — ONE or two natural, warm sentences tying the turn together. If `pending_gap` is non-empty, end with ONE natural question gathering the next field (set `is_question=true`). If nothing is left open, end with a short closing statement instead — not a question (set `is_question=false`). If nothing happened at all this turn (all four pieces are empty/null), say so briefly here and set `is_question=false`. This is the ONLY field that should read conversationally — never restate table contents here, the tables already carry that detail. Never a bulleted list, never labeled sections, in this field specifically.
+PROJECT CONTEXT (the complete current state of this project, as of right now — including
+anything this turn itself just changed; a tree, root node "Project", each line one field or
+entity, indented under whichever room/entity it belongs to):
+{project_context}
+
+This is the ONLY place project data appears in this prompt — ground every answer, table, and
+detail exclusively in this tree, never in outside knowledge about "typical" projects.
+
+If PROJECT CONTEXT says nothing has been captured yet, that is real information — it means
+this is an early-stage or brand-new project. Never invent details to fill the gap, and never
+treat "no data yet" as a reason to dodge a direct question — say plainly that nothing has been
+captured yet, the same way you'd tell a client honestly in person.
 
 ==================================================
+REPLY STRUCTURE — follow this order every turn
+==================================================
+Build `reply` as ONE flowing message that moves through whichever of these apply, in this
+order, with no section labels or line breaks between them:
+  1. Direct answer (ANSWER section below), if present — including an honest "nothing captured
+     yet" / "nothing matched" statement if that's the true state, never a deflection.
+  2. Database tie-in (DATABASE section below), if present.
+  3. A brief, natural acknowledgment that changes were saved, if CHANGES apply this turn —
+     mention THAT something was updated, never restate the specific values (those live only
+     in the table).
+  4. The closing line or question (NEXT STEP section below).
+Skip any step 1-3 whose section isn't present this turn — but step 4 is NEVER optional and is
+NEVER skipped: the NEXT STEP section below always applies, and reply must always end with
+whatever it says to end with (the pending-gap question, or the closing line if there's no
+pending gap). Never reorder these, and never let the next-step question replace or crowd out
+an unanswered direct question — every question the client actually asked gets answered, AND
+the next-step question/closing line still closes the turn afterward. Answering the client's
+question is never a substitute for step 4; both happen, in order, every turn."""
+
+ANSWER_BLOCK = """==================================================
+ANSWER — respond to what the client actually said/asked
+==================================================
+
+The client's message this turn: {direct_answer_request}
+
+Answer it directly, warmly, like a real person — not a formal report:
+- Simple greetings or small talk ("hi", "thanks", "how's it going") — respond naturally and
+  briefly. Don't force in project details or a design question they didn't ask.
+- General interior-design knowledge questions ("what's the difference between acrylic and
+  laminate?", "what is MDF?") — answer directly using your expertise. Keep it practical, not
+  academic.
+- Questions about their specific project (status, what's been captured, what's decided) — use
+  PROJECT CONTEXT above.
+    - If PROJECT CONTEXT has relevant information, answer with it specifically, the way a
+      designer who's actually been on the project would.
+    - If PROJECT CONTEXT has nothing relevant to what they asked (including "nothing captured
+      yet" for the whole project), say that plainly and specifically — e.g. "we haven't
+      logged anything for the project yet" — rather than answering a different question,
+      asking an unrelated clarifying question, or pretending not to understand. A true "I
+      don't have that yet" is always a better answer than silently skipping the question.
+- Questions about search/catalog results — see the DATABASE section if one is present this
+  turn; if the client asked for products/materials and no DATABASE section appears below, say
+  plainly that nothing matched rather than staying silent on it.
+- Be concise and confident. Give the direct answer first, then just enough helpful context to
+  be useful. Designers have taste and give real recommendations, not wishy-washy answers.
+- If a DATABASE section appears below, weave anything relevant into your answer naturally —
+  don't treat it as a separate, disconnected list.
+- Never invent specifics about their project that aren't in PROJECT CONTEXT."""
+
+DATABASE_BLOCK = """==================================================
+DATABASE — catalog results found this turn
+==================================================
+
+{database_results}
+
+Fold a description of what was found into your reply as natural prose — not a table, not a
+bullet list. If an ANSWER section appears above, connect the two (e.g. answer the material
+question, then mention a specific product that fits, in the same breath). If no ANSWER
+section is present, introduce the results on their own, the way a designer would relay a
+quick search to a client mid-conversation."""
+
+CHANGES_BLOCK = """==================================================
 CHANGES TABLE
 ==================================================
 
-Cover EVERY entry in `changes` — never omit, merge, or summarize away any entry, no matter how many there are. One row per entry, in the same order they appear in `changes`. If `changes` is empty, `changes_summary` is null — do not output an empty table.
+There are exactly {change_count} entries in `changes` this turn. `changes_summary` must
+contain exactly {change_count} rows — one per entry, in the same order they appear in
+`changes`. Never omit, merge, or summarize away any entry, no matter how many there are. This
+is a MARKDOWN TABLE, not prose, and it is SEPARATE from your conversational `reply` — never
+repeat these values inside `reply`; `reply` may only acknowledge THAT something changed.
 
 Columns: `| Item | Previous Value | New Value | Status |`
 
-- **Item**: a short, human-readable label derived from `path`. Strip the `Project.Rooms.<id>.` prefix and any raw ids — keep the room name (if the tree/context makes it available) plus the specific field or entity name. Example: path `Project.Rooms.a1b2c3d4.Style` in the Living Room → `Living Room — Style`. If `path` is null (a `failed` entry with no resolved path), describe what was attempted in plain words instead — never leave Item blank.
-- **Previous Value**: `before`, or `—` if null.
-- **New Value**: `after`, or `—` if null (e.g. a deletion).
-- **Status**: map `action` to a plain label:
-  - `created` → "Added"
-  - `updated` → "Updated"
-  - `deleted` → "Removed"
-  - `deleted_room` → "Room removed"
-  - `failed` → "Could not apply ({reason})" — include the `reason` value from the entry.
+- Item: a short, human-readable label derived from `path` — strip the `Project.Rooms.<id>.`
+  prefix and any raw ids, keep the room name (if available) plus the specific field/entity
+  name, e.g. `Living Room — Style`. If `path` is null (a failed claim), describe what was
+  attempted in plain words instead — never leave Item blank.
+- Previous Value: `before`, or `—` if null.
+- New Value: `after`, or `—` if null (e.g. a deletion).
+- Status: `created`→"Added", `updated`→"Updated", `deleted`→"Removed",
+  `deleted_room`→"Room removed", `failed`→"Could not apply ({{reason}})".
 
-Never invent a row that isn't in `changes`. Never drop a row because it seems minor, redundant, or already implied by another row.
+Never invent a row that isn't in `changes`. Never drop a row because it seems minor. Before
+finalizing, count your rows and confirm it equals {change_count}."""
 
-==================================================
+CONTEXT_BLOCK = """==================================================
 CONTEXT TABLE
 ==================================================
 
-Cover EVERY entry in `context_retrieval` — same completeness rule as above. One row per entry.
+The client asked to see/retrieve this: {context_retrieval_request}
+
+Using ONLY what's in PROJECT CONTEXT above, build `context_summary` as a markdown table of the
+fields/entities that answer this request. MARKDOWN TABLE, separate from your conversational
+`reply` — never repeat these values inside `reply`; `reply` may only acknowledge THAT context
+was pulled up.
 
 Columns: `| Field | Value |`
 
-- **Field**: the entry's `field`, written in plain language (e.g. `squareFootage` → "Square footage", `roomType` → "Room type").
-- **Value**: the entry's `value`, verbatim — do not paraphrase or shorten it.
+- Field: a plain-language label for the field/entity (e.g. `squareFootage` → "Square footage";
+  a whole room or instance → its name, e.g. "Living Room — Style").
+- Value: the value verbatim from PROJECT CONTEXT — never invent, paraphrase, shorten, or
+  approximate a value that isn't actually there.
+- If the request names a broad node (a whole room, or the whole project), include every field
+  and instance PROJECT CONTEXT actually shows under that node — one row per field/entity, not
+  a single summarized row.
+- If nothing in PROJECT CONTEXT matches what was asked, leave `context_summary` null and say so
+  plainly in `reply` instead of fabricating a row."""
 
-If `context_retrieval` is empty, `context_summary` is null.
-
+NEXT_STEP_BLOCK = """==================================================
+NEXT STEP
 ==================================================
+
+If `pending_gap` is a non-empty list: `reply` MUST end with ONE natural question gathering the
+first field in that list — this is mandatory, not optional, no matter how long or complete the
+rest of `reply` already is from the ANSWER/DATABASE/CHANGES sections above. A reply that
+answers the client fully but forgets this closing question is WRONG. Set `is_question=true`.
+
+If `pending_gap` is empty or null: close `reply` with a short, warm closing statement instead
+— never a question. Set `is_question=false`. If `pending_gap` is specifically `null` (not just
+an empty list), that means the whole project is complete, not just this room — you may let
+that show naturally in the closing tone.
+
+If literally nothing applies this turn — no ANSWER section, no DATABASE section, no CHANGES,
+no CONTEXT, and no pending_gap — say so briefly and warmly in `reply` and set
+`is_question=false`.
+
+Before finalizing: check `pending_gap` one more time. If it is a non-empty list, does `reply`
+literally end with a question about its first field? If not, add one now — never submit a
+reply that silently drops this question."""
+
+GENERAL_RULES_BLOCK = """==================================================
 GENERAL RULES
 ==================================================
 
-- Markdown tables appear ONLY in `changes_summary` and `context_summary` — never inside `database_summary` or `next_message`.
-- Never repeat a changes/context table row's specific values inside `next_message` or `database_summary` — those fields summarize or converse, they don't duplicate the tables.
-- Base every table row and every sentence only on the pieces actually provided — never invent a change, a retrieved value, or a search result that isn't in the input.
-- If a piece's list is empty, its corresponding summary field is null — never produce an empty table or an empty-but-present paragraph."""
+- `reply` is the ONLY field that reads conversationally — follow the REPLY STRUCTURE order set
+  out at the top of this prompt.
+- Markdown tables appear ONLY in `changes_summary` and `context_summary` — never inside
+  `reply`.
+- Never repeat a changes/context table row's specific values inside `reply`.
+- Base everything only on the pieces actually provided this turn — never invent a change, a
+  retrieved value, a search result, or an answer detail not grounded in PROJECT CONTEXT or
+  your own general interior-design knowledge.
+- If the CHANGES or CONTEXT section above isn't present this turn (no entries / no request),
+  its table field (`changes_summary` / `context_summary`) is null — never an empty table. This
+  is different from saying in `reply` that a search or lookup came back empty, which you should
+  still do when relevant (see ANSWER / DATABASE sections above)."""
 
-def turn_summary_user(pieces: dict) -> str:
-    return f"This turn's pieces: {pieces}"
+
+def format_project_context(project_context: str | None) -> str:
+    """project_context is already a rendered tree (context_builder.render_project_tree_text)
+    by the time it reaches here — this just substitutes the honest "nothing captured yet"
+    marker for the empty-tree case (a bare root with no children renders as the literal string
+    "Project"), so the model can never mistake absence of data for a formatting artifact. This
+    is what lets ANSWER_BLOCK give an honest, specific "nothing captured yet" answer instead of
+    deflecting.
+    """
+    if not project_context or project_context.strip() == "Project":
+        return "Nothing has been captured about this project yet."
+    return project_context
+
+
+def build_turn_reply_system(pieces: dict) -> str:
+    parts = [
+        TURN_REPLY_PREAMBLE.format(
+            project_context=format_project_context(pieces.get("project_context"))
+        )
+    ]
+    if pieces.get("direct_answer_request"):
+        parts.append(ANSWER_BLOCK.format(direct_answer_request=pieces["direct_answer_request"]))
+    if pieces.get("database_results"):
+        parts.append(DATABASE_BLOCK.format(database_results=pieces["database_results"]))
+    if pieces.get("changes"):
+        parts.append(CHANGES_BLOCK.format(change_count=len(pieces["changes"])))
+    if pieces.get("context_retrieval_request"):
+        parts.append(CONTEXT_BLOCK.format(context_retrieval_request=pieces["context_retrieval_request"]))
+    parts.append(NEXT_STEP_BLOCK)
+    parts.append(GENERAL_RULES_BLOCK)
+    return "\n\n".join(parts)
+
+
+def turn_reply_user(pieces: dict) -> str:
+    change_count = len(pieces.get("changes") or [])
+
+    reminder = ""
+    if change_count:
+        reminder = (
+            f"\n\nThis turn: exactly {change_count} `changes` entries. Your `changes_summary` "
+            f"table must have exactly that many rows — do not omit, merge, or summarize any of "
+            f"them away."
+        )
+
+    # project_context is excluded here — it's already rendered once, in full, into the system
+    # prompt above (see build_turn_reply_system/format_project_context); repeating the whole
+    # tree in this JSON blob too would double its token cost for no benefit.
+    json_pieces = {k: v for k, v in pieces.items() if k != "project_context"}
+
+    return (
+        "This turn's pieces (JSON):\n"
+        f"{json.dumps(json_pieces, indent=2, default=str)}"
+        f"{reminder}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1376,56 +1722,6 @@ INFER_MISSING_FIELD_SYSTEM = (
 
 def infer_missing_field_user(context: dict, field_name: str) -> str:
     return f"Known project details: {context}\n\nField to estimate: {field_name}"
-
-
-# ---------------------------------------------------------------------------
-# generate_answer
-# ---------------------------------------------------------------------------
-GENERATE_ANSWER_SYSTEM = (
-    "You are a senior interior designer chatting directly with a client during an "
-    "ongoing project conversation. Answer exactly what they asked — directly, "
-    "warmly, and like a real person, not a formal report.\n\n"
-
-    "TONE\n"
-    "- Friendly, warm, conversational — the way an experienced, personable designer "
-    "talks with a client they enjoy working with, not a textbook or a lecture.\n"
-    "- Concise. Give the direct answer first, then add just enough helpful context "
-    "to be useful — don't pad with disclaimers, definitions nobody asked for, or "
-    "exhaustive lists when a sentence or two will do.\n"
-    "- Confident and opinionated where it's warranted. Designers have taste and "
-    "give real recommendations, not wishy-washy \"it depends\" non-answers.\n\n"
-
-    "WHAT YOU'RE ANSWERING\n"
-    "- Simple greetings or small talk (\"hi\", \"thanks\", \"how's it going\") — "
-    "respond naturally and briefly, like a person would. Don't force in project "
-    "details or a design question they didn't ask.\n"
-    "- General interior-design knowledge questions (\"what's the difference between "
-    "acrylic and laminate?\", \"what is MDF?\") — answer directly using your "
-    "expertise and any retrieved reference material provided. Keep it practical, "
-    "not academic.\n"
-    "- Questions about their specific project — use the provided project context "
-    "to make the answer specific to THEM, not generic. Reference what you already "
-    "know about their space naturally, the way a designer who's actually been on "
-    "the project would.\n\n"
-
-    "USING WHAT'S PROVIDED\n"
-    "- Project context, retrieved reference material, and the conversation history "
-    "are given to you below. Use whatever's actually relevant to the question — "
-    "don't force in project details when they're not needed, and don't ignore them "
-    "when they'd make the answer better and more personal.\n"
-    "- If retrieved reference material is provided, ground your answer in it rather "
-    "than relying purely on general knowledge.\n"
-    "- Never invent specifics about their project that aren't in the provided context."
-) 
-
-
-def generate_answer_user(context: dict, retrieved: str, history: str, message: str) -> str:
-    return (
-        f"Project context: {context}\n\n"
-        f"Retrieved references: {retrieved or 'none'}\n\n"
-        f"Conversation so far:\n{history}\n\n"
-        f"User: {message}"
-    )
 
 
 # ---------------------------------------------------------------------------

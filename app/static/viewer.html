@@ -176,6 +176,20 @@
   .msg .role { font-size: 10px; text-transform: uppercase; color: #888; margin-bottom: 3px; }
   .empty { color: #555; font-size: 13px; font-style: italic; }
   .msg.pending { opacity: 0.7; }
+  /* app.llm.generate_turn_reply's changes_summary/context_summary — markdown
+     tables that accompany `reply` for the same turn (see Message.context_summary/
+     changes_summary), rendered as-is rather than parsed into an HTML table:
+     they're small, already pipe-aligned, and this avoids pulling in a
+     markdown dependency for a dev viewer. */
+  .msg-summary { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c3325; }
+  .msg-summary-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: #7ee0a8;
+    margin-bottom: 4px;
+  }
+  .msg-summary pre {
+    white-space: pre-wrap; word-break: break-word; margin: 0; font-family: inherit;
+    font-size: 12px; color: #ccc;
+  }
   /* Clarifying-question options (app.chat's operation_questions SSE event —
      see app.graph._generate_operation_questions). Renders the LLM-provided
      fixed option buttons; no free-text input (the "allow_custom" affordance
@@ -572,6 +586,7 @@ function renderConversation(messages) {
     const div = document.createElement('div');
     div.className = 'msg ' + m.role;
     div.innerHTML = `<div class="role">${m.role}</div><div>${escapeHtml(m.content)}</div>`;
+    appendSummaryBlocks(div, m.context_summary, m.changes_summary);
     el.appendChild(div);
   });
   el.scrollTop = el.scrollHeight;
@@ -1002,6 +1017,30 @@ function appendLiveMessage(role, content) {
   return div;
 }
 
+// app.llm.generate_turn_reply's changes_summary/context_summary — the
+// per-turn markdown tables that ride alongside `reply` (see
+// Message.context_summary/changes_summary, app.chat's pipeline_result
+// event). Appended into `msgDiv` (an assistant .msg element, live or
+// reloaded) as their own labeled blocks, kept out of the reply bubble's own
+// .content so they read as distinct from the conversational text per
+// app.prompts.GENERAL_RULES_BLOCK ("Markdown tables ... never inside
+// `reply`"). Textual only (no markdown->HTML table parsing) — .textContent
+// avoids ever needing to trust/escape LLM-produced table content by hand.
+function appendSummaryBlocks(msgDiv, contextSummary, changesSummary) {
+  const blocks = [
+    ['Context', contextSummary],
+    ['Changes', changesSummary],
+  ];
+  for (const [label, text] of blocks) {
+    if (!text) continue;
+    const block = document.createElement('div');
+    block.className = 'msg-summary';
+    block.innerHTML = `<div class="msg-summary-label">${label}</div><pre></pre>`;
+    block.querySelector('pre').textContent = text;
+    msgDiv.appendChild(block);
+  }
+}
+
 // Holds this session's trace entries between full /state refetches — appended
 // to live as 'trace' SSE events arrive during a send, then wholly replaced by
 // the authoritative list once loadSession() runs at the end of the turn.
@@ -1116,8 +1155,11 @@ async function streamChatEvents(body) {
   document.getElementById('sendBtn').disabled = true;
   setStatus('sending...');
 
+  // Pending placeholder bubble while the turn runs — nothing streams into it
+  // any more (generate_turn_reply produces the whole reply in one shot, not
+  // token-by-token), so every branch below just removes it once the real
+  // reply/questions/error arrives.
   const liveAssistant = appendLiveMessage('assistant', '');
-  let answerText = '';
 
   try {
     const res = await fetch('/chat', {
@@ -1144,10 +1186,7 @@ async function streamChatEvents(body) {
         const line = part.trim();
         if (!line.startsWith('data:')) continue;
         const evt = JSON.parse(line.slice(5).trim());
-        if (evt.type === 'token') {
-          answerText += evt.content;
-          liveAssistant.querySelector('.content').textContent = answerText;
-        } else if (evt.type === 'progress') {
+        if (evt.type === 'progress') {
           setStatus(`running: ${evt.node}...`);
         } else if (evt.type === 'trace') {
           liveTrace = liveTrace.concat(evt.entries);
@@ -1155,18 +1194,21 @@ async function streamChatEvents(body) {
         } else if (evt.type === 'pipeline_result') {
           // app.pipeline.run_pipeline's single join-step reply — replaces
           // the old separate context_updated/ask_question/confirm_change/
-          // wrapup events (see app.chat.run_chat_turn's docstring). message
-          // is either the next question (is_question=true) or a closing/
-          // completion line; either way it's not streamed token-by-token,
-          // so the pending assistant bubble is still empty here — drop it.
-          if (!answerText) liveAssistant.remove();
-          appendLiveMessage('assistant', evt.message);
+          // wrapup events (see app.chat.run_chat_turn's docstring). reply is
+          // either the next question (is_question=true) or a closing/
+          // completion line, already folding in any direct answer/database
+          // results for this turn (see app.llm.generate_turn_reply).
+          // context_summary/changes_summary are this same turn's markdown
+          // tables — appended below the reply bubble, not merged into it.
+          liveAssistant.remove();
+          const replyDiv = appendLiveMessage('assistant', evt.reply);
+          appendSummaryBlocks(replyDiv, evt.context_summary, evt.changes_summary);
         } else if (evt.type === 'operation_questions') {
           // classify_intent_node held the whole write batch back — at least
           // one op's graph connection is still null and the model judged
           // the ambiguity real (see app.graph._generate_operation_questions).
           // Nothing writes until every question below is answered.
-          if (!answerText) liveAssistant.remove();
+          liveAssistant.remove();
           renderOperationQuestions(evt.questions);
         } else if (evt.type === 'image_description') {
           appendLiveMessage('assistant', '[image] ' + evt.content);

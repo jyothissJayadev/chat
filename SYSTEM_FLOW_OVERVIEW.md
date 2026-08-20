@@ -69,9 +69,8 @@ flowchart LR
         FA["first action — writes/deletes"]
         CR["context retrieval"]
         DQ["database query"]
-        DA["direct answer — streamed"]
         KG["knowledge-gap detection"]
-        TS["turn summary — final LLM call"]
+        TS["turn reply — the single join LLM call (answer + results + question folded in)"]
     end
 
     subgraph Support["Support modules"]
@@ -137,10 +136,12 @@ flowchart TD
     H --> H0["Partition tasks: write (EDIT/DELETE), retrieval, query, answer"]
     H0 --> P1
     H0 --> P2
+    H0 --> P3
 
     subgraph Concurrent["Started immediately, fully concurrent"]
-        P1["DIRECT_ANSWER branch (if any ANSWER tasks): llm.generate_answer() STREAMED token-by-token -> 'token' SSE events"]
+        P1["ANSWER branch (if any ANSWER tasks): NO LLM call — the tasks' .target text is joined into `direct_answer_request` for the join call below"]
         P2["DATABASE_RETRIEVAL branch (if any DATABASE_QUERY tasks): llm.generate_search_keywords() -> rag.query_catalog() Atlas vectorSearch"]
+        P3["project_context fetch: context_builder.known_fields(project_id, active_room_id) — pre-write room focus; grounds the join call's ANSWER block"]
     end
 
     H0 --> W{"write tasks present?"}
@@ -153,20 +154,20 @@ flowchart TD
     J --> K["retrieval.load_subtree() for each RETRIEVE_CONTEXT task's root path"]
     J --> L["question_engine.find_knowledge_gaps(project_id, active_room_id, skipped_rooms) -> KnowledgeGapBatch or None"]
 
-    P2 --> M["Gather all branches"]
+    P2 --> M["Gather all branches (query results, project_context, retrieval, gaps, first action)"]
+    P3 --> M
     K --> M
     L --> M
     M --> N{"gaps == None?"}
     N -->|"yes: project complete"| N1["_materialize_project(): ProjectContext snapshot (summary + inferred/calculated assumptions) -> Mongo"]
     N -->|"no"| N2["in progress"]
     N1 --> O
-    N2 --> O{"anything happened this turn? (writes/retrieval/query/open gaps)"}
-    O -->|"yes"| O1["llm.generate_turn_summary(pieces) -> TurnSummary {database_summary, context_summary, changes_summary, next_message, is_question}"]
-    O -->|"no (pure DIRECT_ANSWER turn)"| O2["answer already streamed; no summary"]
-    P1 --> R
+    N2 --> O["generate_turn_reply runs UNCONDITIONALLY, exactly once per turn"]
 
-    O1 --> R["Back in app/chat.py: persist user + assistant messages, skipped_rooms, active_room_id, trace, status ('complete' if gaps None), pending_gap OR pending_operation_questions; save_session() -> Mongo"]
-    O2 --> R
+    O --> O1["llm.generate_turn_reply(pieces) -> TurnReply {reply, changes_summary, context_summary, is_question}"]
+    O1 --> R
+
+    R["Back in app/chat.py: persist user + assistant messages, skipped_rooms, active_room_id, trace, status ('complete' if gaps None), pending_gap OR pending_operation_questions; save_session() -> Mongo"]
     R --> S["Emit 'pipeline_result' (the turn's reply) + 'done' {session_id, status}; Langfuse span closed with output"]
 ```
 
@@ -248,14 +249,20 @@ The heart of a turn. Branches by task type, with deliberate ordering rules:
 | **First action** | `EDIT_CONTEXT`, `DELETE_CONTEXT` | Sequential, first | `_run_first_action()` | write tasks + live tree + live-node snapshot | `FirstActionResult {written, retracted, changes, active_room_id}` + trace |
 | **Context retrieval** | `RETRIEVE_CONTEXT` | After writes (must see post-write state) | `_run_context_retrieval()` | retrieval tasks | `list[KnowledgeNode]` (subtree deduped) |
 | **Database query** | `DATABASE_QUERY` | Concurrent from the start | `_run_database_query()` | query tasks | `list[{title, description}]` catalog results + trace |
-| **Direct answer** | `ANSWER` | Concurrent from the start, streamed | `_run_direct_answer()` | answer tasks + known fields | streamed answer text (SSE `token` events) + trace |
-| **Gap detection** | every turn | After writes | `question_engine.find_knowledge_gaps()` | project + active/skipped rooms | `KnowledgeGapBatch` or `None` (= complete) |
-| **Turn summary** | when anything happened | Last, single join call | `llm.generate_turn_summary()` | `pieces {changes, context_retrieval, database_results, pending_gap}` | `TurnSummary` + trace |
+| **Direct answer** | `ANSWER` | No LLM call of its own — `.target` text joins into `pieces["direct_answer_request"]` | — | answer tasks | nothing but the request text for the join call |
+| **Project context** | every turn | Concurrent from the start (pre-write `active_room_id`) | `context_builder.known_fields()` | project + active room | `{field_name: value}` dict grounding the join call's ANSWER block |
+| **Gap detection** | every turn | After writes (must see post-write state) | `question_engine.find_knowledge_gaps()` | project + active/skipped rooms | `KnowledgeGapBatch` or `None` (= complete) |
+| **Turn reply** | every turn | Last — the single join call, runs unconditionally | `llm.generate_turn_reply()` | `pieces {direct_answer_request, project_context, changes, context_retrieval, database_results, pending_gap}` | `TurnReply {reply, changes_summary, context_summary, is_question}` + trace |
 | **Completion** | when gaps == None | On completeness | `_materialize_project()` | live tree | `ProjectContext` row in Mongo (summary + assumptions) |
 
 **Why writes run first:** both context retrieval and gap detection read the live graph, so they must
-see post-write state. Database query and direct answer don't depend on this turn's writes, so they
-run concurrently from the start.
+see post-write state. Database query and project context don't depend on this turn's writes, so they
+run concurrently from the start — project context intentionally uses the **pre-write** active room
+(the `CHANGES` block already carries this turn's own updates, so the ANSWER grounding never needs
+them). The direct answer produces **no** separate LLM call or stream any more: it's just text folded
+into `pieces["direct_answer_request"]` and handled by the same join call that composes the rest of
+the reply. Because the join call needs this turn's post-write `changes` and `pending_gap`, it is the
+very last step, and it runs exactly once — every turn.
 
 ### Stage 7 — First action internals (`_run_first_action`)
 
@@ -291,20 +298,24 @@ Walks `ontology/v1.yaml` itself (no hand-maintained field list) against live nod
 | **Input** | `project_id`, `active_room_id`, `skipped_rooms` |
 | **Expected output** | `KnowledgeGapBatch {gaps: [KnowledgeGap {canonical_path, field_label, node_type, room_id?}], room_id?}` or `None`. |
 
-### Stage 9 — Turn summary (`app/llm.py::generate_turn_summary`)
+### Stage 9 — Turn reply (`app/llm.py::generate_turn_reply`)
 
-One LLM call (`settings.model_question_gen`) that composes the user-visible reply from whatever
-actually happened — changes made, context retrieved, catalog results, and the next open field(s) —
-as ONE natural message ending in either a question (`is_question=true`) or a closing line.
+The single join step. One LLM call (`settings.model_question_gen`) runs **unconditionally, exactly
+once per turn** (the only LLM call that produces user-facing text) and folds whichever pieces this
+turn actually produced — the direct answer request, project context, changes made, context
+retrieved, catalog results, and the next open field(s) — into ONE natural `reply` that ends in
+either a question (`is_question=true`) or a closing line. Replaces the old two-call split
+(`generate_answer` streaming + `generate_turn_summary`); the system prompt is assembled
+block-by-block (`build_turn_reply_system`) so a turn only ever sees the sections its pieces need.
 
 | | |
 |---|---|
-| **Input** | `pieces {changes, context_retrieval, database_results, pending_gap}` |
-| **Expected output** | `TurnSummary {database_summary?, context_summary?, changes_summary?, next_message: str, is_question: bool}` → SSE `pipeline_result`. |
+| **Input** | `pieces {direct_answer_request?, project_context, changes, context_retrieval, database_results, pending_gap}` |
+| **Expected output** | `TurnReply {reply: str, changes_summary?, context_summary?, is_question: bool}` → SSE `pipeline_result`. |
 
 ### Stage 10 — Persistence & turn end (`app/chat.py` tail of `run_chat_turn`)
 
-Appends the user message (+ assistant `answer` and `next_message`) to `session.messages`, merges
+Appends the user message and the assistant `reply` to `session.messages`, merges
 `skipped_rooms` / `current_field` / `active_room_id`, extends `session.trace`, sets
 `status = "complete" | "in_progress"`, stores **either** `pending_gap` (ordinary gap question) or
 `pending_operation_questions` (held turn), then `save_session()` and emits `done`.
@@ -324,7 +335,7 @@ Appends the user message (+ assistant `answer` and `next_message`) to `session.m
 | `CONTEXT_DELETE` | `DELETE_CONTEXT` | first action | Yes — retracts nodes (soft delete) |
 | `CONTEXT_RETRIEVAL` | `RETRIEVE_CONTEXT` | context retrieval (post-write) | Read-only |
 | `DATABASE_RETRIEVAL` | `DATABASE_QUERY` | database query (concurrent) | No — reads Mongo catalog |
-| `DIRECT_ANSWER` | `ANSWER` | direct answer (concurrent, streamed) | Read-only (known fields as context) |
+| `DIRECT_ANSWER` | `ANSWER` | direct answer (folded into the join call) | Read-only (project context as grounding) |
 
 ---
 
@@ -333,15 +344,17 @@ Appends the user message (+ assistant `answer` and `next_message`) to `session.m
 | Event | Payload | When |
 |---|---|---|
 | `image_description` | `{content}` | Image turn, before the graph runs |
-| `token` | `{content}` | DIRECT_ANSWER streaming |
 | `progress` | `{node}` | Per completed graph node |
 | `trace` | `{node, entries: [TraceEntry]}` | Per node — input/output summaries, duration, model, full LLM prompt/response for LLM steps |
-| `operation_progress` | `{stage, ok}` | Per pipeline stage (`first_action`, `context_retrieval`, `database_query`, `summary`, `direct_answer`) |
-| `pipeline_result` | `{database_summary?, context_summary?, changes_summary?, message, is_question}` | The turn's single join-step reply |
+| `operation_progress` | `{stage, ok}` | Per pipeline stage (`first_action`, `context_retrieval`, `database_query`, `summary`) |
+| `pipeline_result` | `{context_summary?, changes_summary?, reply, is_question}` | The turn's single join-step reply — the whole conversational text (direct answer + database results + next question/closing, folded into one) |
 | `operation_questions` | `{questions: [...]}` | Turn held for room/entity clarification |
 | `error` | `{message}` | Graph failure / no result |
 | `done` | `{session_id, status}` | Always last; `status` ∈ `in_progress` / `complete` |
 | (heartbeat) | `: keep-alive` comment line | Every 8s of graph silence — keeps proxies/browsers from dropping idle connections |
+
+> The old `token` event (streamed DIRECT_ANSWER chunks) is gone — `generate_turn_reply` produces
+> the whole reply in one shot, so the viewer renders it only when `pipeline_result` arrives.
 
 ---
 
@@ -412,10 +425,12 @@ User: `"The project is a 3BHK renovation, budget is 25 lakh. Add a modern kitche
    (kitchen → connection `"Kitchen"` = new room name), DATABASE_RETRIEVAL (laminates), DIRECT_ANSWER
    (MDF).
 2. All connections grounded → no clarification hold.
-3. Pipeline: database query + MDF answer start concurrently and the answer streams as `token`
-   events; meanwhile the first action writes `ProjectType`, `Budget.Total`, mints a room id for
-   "Kitchen" and writes its `RoomType`/`Style`/`SquareFootage` — with version rows for each.
-4. Gap detection finds the kitchen's remaining open fields → turn summary composes
+3. Pipeline: the database query and the project-context fetch start concurrently; the first action
+   writes `ProjectType`, `Budget.Total`, mints a room id for "Kitchen" and writes its
+   `RoomType`/`Style`/`SquareFootage` — with version rows for each. The MDF question is **not** a
+   separate streamed call — its text rides along as `direct_answer_request`.
+4. Gap detection finds the kitchen's remaining open fields → the single `generate_turn_reply` call
+   folds the MDF answer, the laminate results, and the next question into one reply:
    *"Noted — renovation, ₹25L total, and a modern 300 sqft kitchen. Here are laminate options… What
    budget do you have in mind for the kitchen, and do you have a timeline?"* (`is_question=true`).
 5. Session saved as `in_progress` with `pending_gap` set; client gets `pipeline_result` then

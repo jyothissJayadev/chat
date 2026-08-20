@@ -1,6 +1,5 @@
 ﻿import json
 import logging
-from collections.abc import AsyncIterator
 from typing import Literal, Optional
 
 import instructor
@@ -517,6 +516,15 @@ class ContextChangeFields(BaseModel):
         None, description="the TOTAL/whole-project budget — only when this operation is Project-scoped, never a single room's own figure"
     )
     timeline: Optional[str] = Field(None, description="only when this operation is Project-scoped")
+    roomType: Optional[str] = Field(
+        None,
+        description=(
+            "THIS room's own type/name, only when the operation states or CHANGES it — e.g. 'bedroom' -> "
+            "'master bedroom'. This is the room-scoped `connection` entity's own type being renamed/refined, "
+            "never a new room being created (a brand-new room's type is set at creation from `connection` "
+            "itself, not through this field) and never a freeform entity mention."
+        ),
+    )
     budgetOrRequirement: Optional[str] = Field(None, description="budget or need for THIS operation's own room specifically")
     style: Optional[str] = None
     squareFootage: Optional[float] = None
@@ -722,11 +730,19 @@ def _validate_context_changes(
                 ))
         for j, mention in enumerate(result.freeform_entities):
             if mention.existing_path is None:
-                if mention.field is not None:
-                    issues.append(ContextChangeValidationError(
-                        result_index=i, kind="freeform_entity", index=j,
-                        detail=f'field="{mention.field}" set without existing_path',
-                    ))
+                # A stray `field`/`value` here (e.g. the model tries
+                # field="Label" while describing a genuinely new item, rather
+                # than leaving both null per rule 4) used to be flagged and
+                # the WHOLE mention dropped by _drop_invalid_claims — but
+                # app.pipeline._apply_update's existing_path-is-None branch
+                # never reads mention.field/value at all (it creates via
+                # map_to_canonical(raw_entity, ...) and ignores them), so the
+                # stray field was always harmless downstream. Flagging it
+                # only cost a real, legitimate new-entity creation for no
+                # correctness benefit — see the "recliner" bug report this
+                # was fixed for (a whole new Furniture item silently
+                # vanishing because of an extra field="Label" the apply step
+                # never even looks at).
                 continue
             if mention.existing_path not in existing_paths:
                 issues.append(ContextChangeValidationError(
@@ -750,11 +766,13 @@ def _validate_context_changes(
             # just the bad part, not the whole parent mention.
             for k, part in enumerate(mention.parts):
                 if part.existing_path is None:
-                    if part.field is not None:
-                        issues.append(ContextChangeValidationError(
-                            result_index=i, kind="part", index=k, entity_index=j,
-                            detail=f'parts[{k}].field="{part.field}" set without existing_path',
-                        ))
+                    # Same reasoning as the entity-level case above: a stray
+                    # field/value on a brand-new part is ignored by
+                    # app.pipeline._apply_parts' existing_path-is-None branch
+                    # (it creates via map_part_to_canonical + separate
+                    # .Material/.Quantity writes, never part.field/value), so
+                    # flagging it only dropped a legitimate new part for no
+                    # correctness benefit.
                     continue
                 if part.existing_path not in existing_paths:
                     issues.append(ContextChangeValidationError(
@@ -944,32 +962,34 @@ async def generate_search_keywords(query: str, *, capture: dict | None = None) -
 
 
 # ---------------------------------------------------------------------------
-# generate_turn_summary — the pipeline's final join step (see
-# app.pipeline.run_pipeline): one call that turns whichever pieces this turn
-# actually produced (changes made, context retrieved, database results,
-# still-open fields) into the turn's actual reply text.
+# generate_turn_reply — the pipeline's single join step (see
+# app.pipeline.run_pipeline): one call that folds whichever pieces this turn
+# actually produced (a direct answer, database results, changes made,
+# context retrieved, still-open fields) into the turn's one reply. Replaces
+# the old generate_turn_summary + generate_answer split — see the
+# TURN_REPLY_SYSTEM merge plan. There is exactly one LLM call per turn for
+# this join step, never two.
 # ---------------------------------------------------------------------------
 
 
-class TurnSummary(BaseModel):
-    database_summary: Optional[str] = Field(None, description="null if no database/catalog search happened this turn")
-    context_summary: Optional[str] = Field(None, description="null if no context retrieval happened this turn")
+class TurnReply(BaseModel):
+    reply: str = Field(description="the turn's one conversational reply to the client")
     changes_summary: Optional[str] = Field(None, description="null if nothing was created/updated/deleted this turn")
-    next_message: str = Field(description="the next question to ask, or a closing/completion line if nothing is left to ask")
-    is_question: bool = Field(description="true if next_message is a question awaiting an answer, false if it's a closing/completion statement")
+    context_summary: Optional[str] = Field(None, description="null if no context retrieval happened this turn")
+    is_question: bool = Field(description="true if reply ends on a question awaiting an answer, false if it's a closing/completion statement")
 
 
-async def generate_turn_summary(pieces: dict, *, capture: dict | None = None) -> TurnSummary:
+async def generate_turn_reply(pieces: dict, *, capture: dict | None = None) -> TurnReply:
     messages = [
-        {"role": "system", "content": prompts.TURN_SUMMARY_SYSTEM},
-        {"role": "user", "content": prompts.turn_summary_user(pieces)},
+        {"role": "system", "content": prompts.build_turn_reply_system(pieces)},
+        {"role": "user", "content": prompts.turn_reply_user(pieces)},
     ]
     if capture is not None:
         capture["messages"] = messages
     result, completion = await structured_client.chat.completions.create_with_completion(
         model=settings.model_question_gen,
-        response_model=TurnSummary,
-        max_tokens=768,
+        response_model=TurnReply,
+        max_tokens=1536,
         max_retries=2,
         messages=messages,
         extra_body=_REASONING_KWARGS,
@@ -1005,26 +1025,6 @@ async def infer_missing_field(field_name: str, context: dict, *, capture: dict |
         capture["raw_output"] = resp.choices[0].message.content
     return (resp.choices[0].message.content or "").strip()
 
-
-async def generate_answer(
-    message: str, context: dict, history: str = "", retrieved: str = "", *, capture: dict | None = None
-) -> AsyncIterator[str]:
-    messages = [
-        {"role": "system", "content": prompts.GENERATE_ANSWER_SYSTEM},
-        {"role": "user", "content": prompts.generate_answer_user(context, retrieved, history, message)},
-    ]
-    if capture is not None:
-        capture["messages"] = messages
-    stream = await client.chat.completions.create(
-        model=settings.model_answer,
-        messages=messages,
-        stream=True,
-        extra_body=_REASONING_KWARGS,
-    )
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            yield delta
 
 
 async def embed(texts: list[str]) -> list[list[float]]:
